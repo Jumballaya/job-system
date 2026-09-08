@@ -1,0 +1,25 @@
+{
+  "name": "job-system",
+  "private": true,
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm run build && pnpm -r --if-present run test",
+    "start": "pnpm run build && pnpm --filter app start"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.18.0",
+      "onFail": "download"
+    }
+  },
+  "type": "module",
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}
