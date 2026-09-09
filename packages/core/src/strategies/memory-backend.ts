@@ -1,5 +1,5 @@
-import { assertSameSubmission, backoffDelay, JobInterruptedError, prepareSubmission, ResultUnavailableError } from "../backend.js";
-import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
+import { assertSameSubmission, backoffDelay, failure, JobInterruptedError, prepareSubmission, ResultUnavailableError } from "../backend.js";
+import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobRecord, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 import { nextRun, occurrence, scheduleId, validateRule } from "../scheduling.js";
 import type { JobSchedules, ScheduleRule } from "../scheduling.js";
 import { ConcurrencyLimits } from "../concurrency.js";
@@ -10,6 +10,10 @@ type Completion = { outcome: JobOutcome } | { error: unknown };
 type Entry = {
   message: JobMessage;
   attempt: number;
+  createdAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  running: boolean;
   availableAt: number;
   scheduleId?: string;
   completion?: Completion;
@@ -40,6 +44,7 @@ export class MemoryBackend implements JobBackend {
   private readonly consumers = new Set<Consumer>();
   private readonly shutdown = new AbortController();
   private readonly resultTTLms: number;
+  private readonly failureTTLms: number;
   private closePromise?: Promise<void>;
   public readonly schedules: JobSchedules = {
     upsert: async (message, rule) => {
@@ -67,9 +72,11 @@ export class MemoryBackend implements JobBackend {
     },
   };
 
-  constructor(options: { resultTTLms?: number } = {}) {
+  constructor(options: { resultTTLms?: number; failureTTLms?: number } = {}) {
     this.resultTTLms = options.resultTTLms ?? 60_000;
+    this.failureTTLms = options.failureTTLms ?? 7 * 24 * 60 * 60_000;
     if (!Number.isFinite(this.resultTTLms) || this.resultTTLms <= 0) throw new Error("resultTTLms must be positive");
+    if (!Number.isFinite(this.failureTTLms) || this.failureTTLms <= 0) throw new Error("failureTTLms must be positive");
   }
 
   public async submit(message: JobMessage): Promise<string> {
@@ -92,7 +99,7 @@ export class MemoryBackend implements JobBackend {
       const active = this.keyed.get(key);
       if (active) return active;
     }
-    const entry: Entry = { message: Object.freeze({ ...message }), attempt: 0, waiters: new Set(),
+    const entry: Entry = { message: Object.freeze({ ...message }), attempt: 0, createdAt: Date.now(), running: false, waiters: new Set(),
       availableAt: message.availableAt ?? Date.now(), ...(schedule ? { scheduleId: schedule } : {}),
     };
     this.entries.set(message.id, entry);
@@ -119,6 +126,25 @@ export class MemoryBackend implements JobBackend {
     this.queue.splice(index, 1);
     this.complete(entry, { error: new ResultUnavailableError(entry.message.id) });
     this.entries.delete(entry.message.id);
+  }
+
+  public async get(id: string, options?: WaitOptions): Promise<JobRecord<string, string> | null> {
+    this.assertOpen();
+    options?.signal?.throwIfAborted();
+    this.prune();
+    const entry = this.entries.get(id);
+    if (!entry) return null;
+    const record = { id, name: entry.message.name, input: entry.message.input, attempts: entry.attempt, createdAt: entry.createdAt };
+    const completion = entry.completion;
+    if (!completion) {
+      return entry.running ? { ...record, status: "running", startedAt: entry.startedAt! }
+        : { ...record, status: "queued", ...(entry.startedAt !== undefined ? { startedAt: entry.startedAt } : {}) };
+    }
+    const terminal = { ...record, startedAt: entry.startedAt!, finishedAt: entry.finishedAt! };
+    if ("error" in completion) return { ...terminal, status: "failed", error: failure(completion.error) };
+    return completion.outcome.status === "succeeded"
+      ? { ...terminal, status: "succeeded", output: completion.outcome.output }
+      : { ...terminal, status: "failed", error: structuredClone(completion.outcome.error) };
   }
 
   public async result(id: string, options?: WaitOptions): Promise<JobOutcome> {
@@ -234,6 +260,8 @@ export class MemoryBackend implements JobBackend {
 
   private async execute(consumer: Consumer, entry: Entry, release: () => void): Promise<void> {
     entry.attempt++;
+    entry.startedAt = Date.now();
+    entry.running = true;
     try {
       const outcome = await consumer.execute(entry.message, new AbortController().signal, entry.attempt);
       if (outcome.status === "failed" && outcome.retryable && entry.attempt < entry.message.policy.attempts) {
@@ -253,6 +281,7 @@ export class MemoryBackend implements JobBackend {
         consumer.failure ??= { error };
       }
     } finally {
+      entry.running = false;
       release();
       consumer.active--;
       if (consumer.stopping && consumer.active === 0) {
@@ -275,7 +304,11 @@ export class MemoryBackend implements JobBackend {
 
   private complete(entry: Entry, completion: Completion): void {
     entry.completion = completion;
-    if (entry.message.policy.idempotencyKey === undefined) entry.expiresAt = Date.now() + this.resultTTLms;
+    entry.finishedAt = Date.now();
+    if (entry.message.policy.idempotencyKey === undefined) {
+      const failed = "error" in completion || completion.outcome.status === "failed";
+      entry.expiresAt = entry.finishedAt + (failed ? this.failureTTLms : this.resultTTLms);
+    }
     const key = entry.message.policy.key;
     if (key !== undefined && this.keyed.get(key) === entry) this.keyed.delete(key);
     for (const waiter of [...entry.waiters]) waiter(completion);
@@ -283,13 +316,17 @@ export class MemoryBackend implements JobBackend {
   }
 
   private prune(): void {
-    const completed: string[] = [];
+    const succeeded: string[] = [];
+    const failed: string[] = [];
     for (const [id, entry] of this.entries) {
       if (entry.expiresAt === undefined) continue;
       if (entry.expiresAt <= Date.now()) this.entries.delete(id);
-      else completed.push(id);
+      else if (entry.completion && ("error" in entry.completion || entry.completion.outcome.status === "failed")) failed.push(id);
+      else succeeded.push(id);
     }
     // Bound idle retained state as well as age; pending work is never evicted.
-    for (const id of completed.slice(0, -MAX_RETAINED_RESULTS)) this.entries.delete(id);
+    for (const records of [succeeded, failed]) {
+      for (const id of records.slice(0, -MAX_RETAINED_RESULTS)) this.entries.delete(id);
+    }
   }
 }

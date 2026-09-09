@@ -32,6 +32,21 @@ export type JobOutcome =
   | { readonly status: "succeeded"; readonly output: string }
   | { readonly status: "failed"; readonly error: JobFailure; readonly retryable: boolean };
 
+/** Execution snapshot; timestamps are Unix milliseconds and startedAt describes the latest delivery. */
+export type JobRecord<Input = unknown, Output = unknown> = {
+  readonly id: string;
+  readonly name: string;
+  readonly input: Input;
+  /** Completed attempts plus the current active attempt; capacity waits and handoffs spend none. */
+  readonly attempts: number;
+  readonly createdAt: number;
+} & (
+  | { readonly status: "queued"; readonly startedAt?: number }
+  | { readonly status: "running"; readonly startedAt: number }
+  | { readonly status: "succeeded"; readonly startedAt: number; readonly finishedAt: number; readonly output: Output }
+  | { readonly status: "failed"; readonly startedAt: number; readonly finishedAt: number; readonly error: JobFailure }
+);
+
 export interface WaitOptions {
   /** Aborts waiting only; accepted work may still execute. */
   readonly signal?: AbortSignal;
@@ -57,6 +72,8 @@ export type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: nu
 export interface JobBackend {
   /** Optional recurring-schedule capability; ordinary jobs need only the delivery methods below. */
   readonly schedules?: JobSchedules;
+  /** Inspect without waiting for completion; null means unknown or expired. Payloads remain encoded. */
+  get?(id: string, options?: WaitOptions): Promise<JobRecord<string, string> | null>;
   /** Accept or replay work; idempotency keys reject changed inputs and survive result cleanup. */
   submit(message: JobMessage): Promise<string>;
   /** Return a retained or future outcome; reject if unknown/expired, aborted, or closed. */
@@ -139,4 +156,9 @@ export class ShutdownTimeoutError extends Error {
     super(`Job system shutdown exceeded ${timeoutMs} ms; unfinished work is still draining`);
     this.name = "ShutdownTimeoutError";
   }
+}
+
+export function failure(error: unknown): JobFailure {
+  if (error instanceof Error) return { name: error.name, message: error.message, ...(error.stack ? { stack: error.stack } : {}) };
+  return { name: "Error", message: typeof error === "string" ? error : "Job failed with a non-Error value" };
 }

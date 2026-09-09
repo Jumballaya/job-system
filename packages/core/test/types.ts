@@ -1,5 +1,5 @@
 import { Container, createJobSystem, defineJob, MemoryBackend } from "../dist/index.js";
-import type { JobHandle, ScheduleHandle, Timing } from "../dist/index.js";
+import type { JobHandle, JobRecord, ScheduleHandle, Timing } from "../dist/index.js";
 
 class Counter {
   add(amount: number): number { return amount; }
@@ -58,6 +58,23 @@ defineJob({
   handler: (input: string) => input,
 });
 const jobs = createJobSystem({ container, jobs: { add, label }, backend: new MemoryBackend() });
+const inspection: Promise<JobRecord | null> = jobs.get("persisted-id");
+async function inspect() {
+  const record = await inspection;
+  if (record?.status === "failed") {
+    const message: string = record.error.message;
+    // @ts-expect-error A failed execution has no successful output.
+    record.output;
+    return message;
+  }
+  if (record?.status === "succeeded") {
+    const output: unknown = record.output;
+    // @ts-expect-error An arbitrary persisted ID cannot promise this catalog's current output type.
+    const assumed: number = record.output;
+    return output;
+  }
+}
+void inspect;
 
 defineJob({
   deps: [Counter],

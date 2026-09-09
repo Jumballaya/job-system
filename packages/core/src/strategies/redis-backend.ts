@@ -1,7 +1,7 @@
-import { DelayedError, Queue, Worker } from "bullmq";
-import type { Job, RedisOptions } from "bullmq";
+import { DelayedError, Job, Queue, Worker } from "bullmq";
+import type { JobJsonRaw, RedisOptions } from "bullmq";
 import { assertSameSubmission, JobInterruptedError, prepareSubmission, ResultUnavailableError } from "../backend.js";
-import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
+import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobRecord, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 import { occurrence, scheduleId, validateRule } from "../scheduling.js";
 import type { JobSchedules, ScheduleRule } from "../scheduling.js";
 import { ConcurrencyLimits } from "../concurrency.js";
@@ -11,12 +11,14 @@ const resultPollIntervalMs = 50;
 const cleanupBatchSize = 100;
 // Return saturated deliveries to Redis so other job types can use the worker immediately.
 const capacityDelayMs = 100;
-type StoredMessage = JobMessage & { readonly resultTTLSeconds?: number; readonly schedule?: ScheduleRule };
+type StoredMessage = JobMessage & { readonly resultTTLSeconds?: number; readonly failureTTLSeconds?: number; readonly schedule?: ScheduleRule };
 
 export interface RedisBackendOptions {
   readonly queue: string;
   readonly connection: Pick<RedisOptions, "host" | "port" | "username" | "password" | "db" | "tls">;
   readonly resultTTLSeconds?: number;
+  /** Failed execution retention; defaults to seven days. Idempotent records remain permanent. */
+  readonly failureTTLSeconds?: number;
 }
 
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -60,6 +62,7 @@ export class RedisBackend implements JobBackend {
   private readonly queue: Queue<StoredMessage, JobOutcome>;
   private readonly connection: RedisOptions;
   private readonly retention: number;
+  private readonly failureRetention: number;
   private readonly workers = new Set<JobWorker>();
   private readonly closed = new AbortController();
   private closing?: Promise<void>;
@@ -100,7 +103,7 @@ export class RedisBackend implements JobBackend {
       : { pattern: rule.cron, tz: rule.timezone };
     await abortable(this.queue.upsertJobScheduler(id, repeat, {
       name: message.name,
-      data: { ...message, schedule: rule, resultTTLSeconds: this.retention },
+      data: { ...message, schedule: rule, resultTTLSeconds: this.retention, failureTTLSeconds: this.failureRetention },
       opts: { attempts: message.policy.attempts, backoff: { ...message.policy.backoff }, removeOnComplete: false, removeOnFail: false },
     }), signal);
   }
@@ -110,8 +113,12 @@ export class RedisBackend implements JobBackend {
       throw new Error("Redis queue must be nonempty and must not contain ':'");
     }
     this.retention = options.resultTTLSeconds ?? 300;
+    this.failureRetention = options.failureTTLSeconds ?? 7 * 24 * 60 * 60;
     if (!Number.isSafeInteger(this.retention) || this.retention < 1) {
       throw new Error("resultTTLSeconds must be a positive safe integer");
+    }
+    if (!Number.isSafeInteger(this.failureRetention) || this.failureRetention < 1) {
+      throw new Error("failureTTLSeconds must be a positive safe integer");
     }
     if (options.connection.port !== undefined &&
       (!Number.isInteger(options.connection.port) || options.connection.port < 1 || options.connection.port > 65535)) {
@@ -146,7 +153,7 @@ export class RedisBackend implements JobBackend {
     const id = redisId(message.id);
     const { attempts, backoff, key } = message.policy;
     const signal = AbortSignal.any([this.closed.signal, AbortSignal.timeout(redisRequestTimeoutMs)]);
-    const added = await abortable(this.queue.add(message.name, { ...message, resultTTLSeconds: this.retention }, {
+    const added = await abortable(this.queue.add(message.name, { ...message, resultTTLSeconds: this.retention, failureTTLSeconds: this.failureRetention }, {
       jobId: id,
       attempts,
       backoff: { type: backoff.type, delay: backoff.delay },
@@ -163,23 +170,55 @@ export class RedisBackend implements JobBackend {
     return message.id;
   }
 
+  private async read(id: string, signal: AbortSignal): Promise<{ job: Job<StoredMessage, JobOutcome>; active: boolean } | null> {
+    signal = AbortSignal.any([signal, this.closed.signal, AbortSignal.timeout(redisRequestTimeoutMs)]);
+    signal.throwIfAborted();
+    const client = await abortable(this.queue.client, signal);
+    const storedId = redisId(id);
+    // Read state and payload in one transaction; completion cannot race into a contradictory snapshot.
+    const replies = await abortable(client.multi().hgetall(this.queue.toKey(storedId))
+      .runCommand("lpos", [this.queue.toKey("active"), storedId]).exec(), signal);
+    if (!replies) throw new Error("Redis inspection transaction was aborted");
+    for (const [error] of replies) if (error) throw error;
+    const raw = replies[0][1] as JobJsonRaw;
+    if (!Object.keys(raw).length) return null;
+    const job = Job.fromJSON<StoredMessage, JobOutcome>(this.queue, raw, storedId);
+    if (Date.now() >= this.expiresAt(job)) return null;
+    return { job, active: replies[1][1] !== null };
+  }
+
+  public async get(id: string, options?: WaitOptions): Promise<JobRecord<string, string> | null> {
+    const snapshot = await this.read(id, options?.signal ?? this.closed.signal);
+    if (!snapshot) return null;
+    const { job, active } = snapshot;
+    const record = { id, name: job.data.name, input: job.data.input, createdAt: job.timestamp,
+      attempts: job.attemptsMade + (active ? 1 : 0) };
+    if (job.finishedOn === undefined) {
+      return active ? { ...record, status: "running", startedAt: job.processedOn! }
+        : { ...record, status: "queued", ...(job.processedOn !== undefined ? { startedAt: job.processedOn } : {}) };
+    }
+    const terminal = { ...record, startedAt: job.processedOn!, finishedAt: job.finishedOn };
+    const outcome = job.returnvalue;
+    if (outcome?.status === "succeeded") return { ...terminal, status: "succeeded", output: outcome.output };
+    const stack = job.stacktrace?.at(-1);
+    const error = outcome?.status === "failed" ? outcome.error
+      : { name: "Error", message: job.failedReason, ...(stack ? { stack } : {}) };
+    return { ...terminal, status: "failed", error };
+  }
+
   public async result(id: string, options?: WaitOptions): Promise<JobOutcome> {
     const signal = options?.signal
       ? AbortSignal.any([this.closed.signal, options.signal])
       : this.closed.signal;
     signal.throwIfAborted();
     while (true) {
-      const job = await abortable(this.queue.getJob(redisId(id)), AbortSignal.any([signal, AbortSignal.timeout(redisRequestTimeoutMs)]));
-      if (!job) throw new ResultUnavailableError(id);
-      const state = await abortable(job.getState(), AbortSignal.any([signal, AbortSignal.timeout(redisRequestTimeoutMs)]));
-      if (state === "completed" || state === "failed") {
-        const finished = await abortable(this.queue.getJob(redisId(id)), AbortSignal.any([signal, AbortSignal.timeout(redisRequestTimeoutMs)]));
-        if (!finished?.finishedOn) throw new ResultUnavailableError(id);
-        this.assertRetained(finished, id);
-        if (state === "failed") throw new Error(`Job infrastructure failed: ${finished.failedReason}`);
-        return finished.returnvalue;
+      const snapshot = await this.read(id, signal);
+      if (!snapshot) throw new ResultUnavailableError(id);
+      const { job } = snapshot;
+      if (job.finishedOn !== undefined) {
+        if (!job.returnvalue) throw new Error(`Job infrastructure failed: ${job.failedReason}`);
+        return job.returnvalue;
       }
-      if (state === "unknown") throw new ResultUnavailableError(id);
       await pause(signal);
     }
   }
@@ -187,7 +226,9 @@ export class RedisBackend implements JobBackend {
   private expiresAt(job: Job<StoredMessage, JobOutcome>): number {
     if (job.finishedOn === undefined || job.data.policy.idempotencyKey !== undefined) return Infinity;
     const policy = job.opts.removeOnComplete;
-    const retention = job.data.resultTTLSeconds ?? (typeof policy === "object" && "age" in policy ? policy.age : this.retention);
+    const resultRetention = job.data.resultTTLSeconds ?? (typeof policy === "object" && "age" in policy ? policy.age : this.retention);
+    const failed = !job.returnvalue || job.returnvalue.status === "failed";
+    const retention = failed ? job.data.failureTTLSeconds ?? resultRetention : resultRetention;
     return job.finishedOn + retention * 1_000;
   }
 

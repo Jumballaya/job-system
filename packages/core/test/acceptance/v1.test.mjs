@@ -3,8 +3,9 @@ import { fork } from "node:child_process";
 import { once } from "node:events";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createJobSystem, defineJob, MemoryBackend } from "../../dist/index.js";
+import { createJobSystem, defineJob, MemoryBackend, RedisBackend } from "../../dist/index.js";
 import { deadline, eventually, kill, pause, Peer, redis, scope } from "./helpers.mjs";
+import { inspectBackend } from "./inspection.mjs";
 
 test("1 — delayed delivery and editable schedules survive producer, worker, and Redis restarts", { timeout: 30_000 }, async (t) => {
   const cleanup = scope(t);
@@ -241,6 +242,11 @@ test("5 — a fresh process can inspect queued, running, retried, and retained f
   assert.deepEqual(await fresh.request("inspect", { id: failed.id }), failure, "failure history vanished with ordinary results or its owning process");
   assert.equal(await fresh.request("inspect", { id: held.id }), null, "ordinary result retention was not enforced");
   assert.equal(await fresh.request("inspect", { id: crypto.randomUUID() }), null);
+  await Promise.all([
+    inspectBackend(new MemoryBackend({ resultTTLms: 1_000, failureTTLms: 2_000 }), 1),
+    inspectBackend(new RedisBackend({ queue: `${server.queue}-inspection`, connection: server.connection,
+      resultTTLSeconds: 1, failureTTLSeconds: 2 }), 2),
+  ]);
 });
 
 test("6 — startup and idle-worker failures reach one error hook without callers, duplicates, or leaked resources", { timeout: 10_000 }, async () => {

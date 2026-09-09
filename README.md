@@ -309,12 +309,41 @@ path decides when to terminate a process that cannot finish; Redis then recovers
 unfinished work through its lease protocol. Memory has no recovery after backend
 close or process exit. Accepted remote work remains queued for other workers.
 
-For jobs without `idempotencyKey`, the memory backend retains results for 60 seconds and at most 1,000 completed jobs;
-configure its age using `new MemoryBackend({ resultTTLms: ... })`. Redis retains
-results for 300 seconds by default (`resultTTLSeconds`), enforced on reads even
-when physical cleanup is deferred. Unknown or expired results reject with
+For jobs without `idempotencyKey`, successful results last 60 seconds in memory
+(`resultTTLms`) or 300 seconds in Redis (`resultTTLSeconds`). Failures default to
+seven days in both backends (`failureTTLms` / `failureTTLSeconds`). Memory caps
+successes and failures independently at 1,000 each, so successful traffic cannot
+evict failure history. Retention is enforced on reads even when physical cleanup
+is deferred. Unknown or expired results reject with
 `ResultUnavailableError`. Idempotent operations are exempt from both age and count
 cleanup; their retained records grow with the number of distinct operation keys.
+
+## Inspect executions
+
+```ts
+const record = await jobs.get(savedJobId);
+if (record?.status === "failed") console.error(record.error.message);
+if (record?.status === "succeeded") console.log(record.output);
+```
+
+`get(id)` reads the existing backend record without submitting work or waiting for
+completion. Redis supports lookup from a different process with the same queue
+and codec, including a producer using `worker: false`. No additional database is
+needed. Unknown or expired IDs return `null`; connection and decoding errors reject.
+
+Records contain `id`, `name`, decoded `input`, `status`, `attempts`, and `createdAt`.
+Status is `queued`, `running`, `succeeded`, or `failed`. `startedAt` describes the
+latest delivery and is absent before the first one. Terminal records add
+`finishedAt` and either `output` or `error` (`name`, `message`, optional `stack`).
+Timestamps are Unix milliseconds. Attempts count completed attempts plus the
+currently active attempt; capacity waits and shutdown handoffs spend none.
+Delayed jobs and retries waiting for their next delivery are `queued`.
+
+Redis reads state and data atomically. Each response is a snapshot; the job may
+advance after the read. `JobRecord` uses a status union; payloads are `unknown`
+because an arbitrary stored ID may come from a different catalog or deployment.
+Lookup uses the same retention as `result()`. It provides retained execution
+details; permanent automation history belongs in the application's data store.
 
 ## Delays and schedules
 
@@ -444,6 +473,7 @@ server's persistence configuration.
 ```ts
 interface JobBackend {
   readonly schedules?: JobSchedules;            // recurring registration and management
+  get?(id: string, options?: WaitOptions): Promise<JobRecord<string, string> | null>;
   submit(message: JobMessage): Promise<string>;   // the ID to wait on
   result(id: string, options?: WaitOptions): Promise<JobOutcome>;
   work(execute: JobExecutor, options?: WorkerOptions): Promise<JobWorker>;
@@ -471,6 +501,10 @@ queue with its ID, deduplication reservation, and attempt budget intact. Other
 callback rejections are infrastructure failures, with
 recovery documented by the adapter. Unknown/expired IDs reject rather than waiting
 forever.
+
+Providers supporting inspection implement `get` with a consistent state snapshot,
+encoded input/output, and retention matching `result()`. Core decodes the payloads.
+An adapter without inspection rejects `jobs.get` with an unsupported-capability error.
 
 `WorkerOptions.concurrencyByJob` carries the catalog's finite per-job limits,
 keyed by registration name. Backends reserve capacity before invoking the executor
@@ -511,8 +545,8 @@ terminal failures, cancellation and shutdown. No tests or infrastructure setup
 are added to the tiny app's source directory.
 
 The six [V1 replacement acceptance contracts](packages/core/test/acceptance/README.md)
-run separately; #1 (timing and schedules), #2 (successor delivery), #3 (workload
-isolation), and #4 (bounded shutdown) pass. #5–#6 intentionally remain failing until implemented:
+run separately; #1–#5 pass. #6 (worker failure reporting) intentionally remains
+failing until implemented:
 
 ```sh
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance

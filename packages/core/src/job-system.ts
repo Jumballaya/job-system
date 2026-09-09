@@ -1,7 +1,7 @@
 import { Container } from "./dep-inject.js";
 import type { Constructor } from "./dep-inject.js";
-import { JobExecutionError, JobInterruptedError, NonRetryableError, prepareSubmission, ShutdownTimeoutError } from "./backend.js";
-import type { JobBackend, JobFailure, JobMessage, JobOutcome, JobPolicy, JobWorker, WaitOptions } from "./backend.js";
+import { failure, JobExecutionError, JobInterruptedError, NonRetryableError, prepareSubmission, ShutdownTimeoutError } from "./backend.js";
+import type { JobBackend, JobMessage, JobOutcome, JobPolicy, JobRecord, JobWorker, WaitOptions } from "./backend.js";
 import { JsonCodec } from "./codec.js";
 import type { JobCodec } from "./codec.js";
 import { delivery } from "./scheduling.js";
@@ -255,6 +255,18 @@ export class JobSystem {
     });
   }
 
+  /** Inspect a stored execution by ID; no worker startup or local submission is needed. */
+  public async get(id: string): Promise<JobRecord | null> {
+    this.assertOpen();
+    if (!this.backend.get) throw new Error("This backend does not support execution inspection");
+    const record = await this.backend.get(id, { signal: this.shutdown.signal });
+    if (!record) return null;
+    const input = this.codec.decode(record.input);
+    return record.status === "succeeded"
+      ? { ...record, input, output: this.codec.decode(record.output) }
+      : { ...record, input };
+  }
+
   public close(): Promise<void> {
     if (this.closing) return this.closing;
     const draining = Promise.resolve().then(async () => {
@@ -366,11 +378,6 @@ export class JobSystem {
       return { status: "failed", error: failure(signal.aborted ? signal.reason : error), retryable: false };
     }
   }
-}
-
-function failure(error: unknown): JobFailure {
-  if (error instanceof Error) return { name: error.name, message: error.message, ...(error.stack ? { stack: error.stack } : {}) };
-  return { name: "Error", message: typeof error === "string" ? error : "Job failed with a non-Error value" };
 }
 
 /** Attaches jobs and starts consuming immediately; close the system during app shutdown. */

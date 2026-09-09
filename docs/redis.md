@@ -14,6 +14,7 @@ const jobs = createJobSystem({
     queue: "memory-jobs",
     connection: { host: "127.0.0.1", port: 6379 },
     resultTTLSeconds: 300,
+    failureTTLSeconds: 7 * 24 * 60 * 60,
   }),
 });
 
@@ -49,8 +50,13 @@ handler timeout. Capacity remains reserved through hooks and asynchronous cleanu
 Limits apply per worker; a fully occupied worker waits for an execution to settle.
 Large saturated backlogs require repeated Redis admission checks.
 
-Ordinary results remain available for the configured TTL after completion, including to
-new backend instances. Expired or unknown IDs reject with `ResultUnavailableError`.
+Successful results remain available for `resultTTLSeconds` after completion.
+Application and infrastructure failures use `failureTTLSeconds`, seven days by
+default. Both policies are stored with the submission, so a fresh reader's settings
+do not change its history. Older records without a failure policy retain their
+original result TTL. Update all workers and producers before relying on the longer
+retention; older adapters can still delete failures using the former cleanup policy.
+Expired or unknown result waits reject with `ResultUnavailableError`.
 The adapter scans bounded batches of completed and failed jobs on later submissions and recurring deliveries,
 removing expired ordinary records. Reads enforce expiry even before cleanup runs.
 BullMQ's queue-wide age/count removal is disabled because it can also delete records
@@ -58,6 +64,15 @@ that individual jobs asked to retain permanently.
 Identical submissions with the same ID are idempotent before its outcome expires;
 reusing the ID for a different message rejects. A retained expired ID rejects too.
 Use a fresh ID for new work; the core job system generates these automatically.
+
+`jobs.get(id)` reads this same record and returns decoded input/output, state,
+attempts, timestamps, and failure details, or `null` for unknown/expired IDs. It works
+for ordinary execution IDs and scheduled occurrence IDs from hooks. One Redis
+transaction reads the job hash and active membership; completion cannot interleave
+between those reads. Application failures are exposed as `failed` even though
+BullMQ stores their final outcomes as completed processing. Infrastructure failures
+are exposed with their saved message and stack. No separate history database or
+application-side status writes are required.
 
 `metadata.idempotencyKey` opts a job into durable replay. Its registration name and
 operation key determine a stable custom job ID, reserved atomically by BullMQ.
