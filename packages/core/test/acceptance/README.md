@@ -1,7 +1,7 @@
 # V1 replacement acceptance contracts
 
-Exactly six top-level tests, numbered to match the agreed gaps. Tests 1–5 pass;
-6 remains intentionally red until implemented. They are separate from the existing regression
+Exactly six top-level tests, numbered to match the agreed gaps. All six pass.
+They are separate from the existing regression
 suite; no tests use `skip`, `todo`, unconditional failure, or feature-detection fallbacks.
 Passing establishes these scenarios, not proof against every possible failure.
 
@@ -25,13 +25,12 @@ at the public backend boundary. Process cleanup runs even when an assertion fail
 | 3 | A backlog limited to one concurrent handler cannot prevent another job type from executing. Capacity waits preserve deduplication and spend no execution attempts. The backlog later drains exactly once without exceeding its job limit or total worker capacity. |
 | 4 | Shutdown stops intake, signals cooperative cancellation, and reports its deadline rather than waiting forever. A replacement cannot execute work still owned by live handlers or unfinished cleanup. After the old process dies, unfinished work recovers without spending a business retry; the replacement shuts down without retained resources. |
 | 5 | A new process inspects work submitted by an exited producer through queued/running/succeeded/failed states, including inputs, timestamps, attempts, outputs, and errors. Failure history outlives ordinary result retention and Redis restart. Both providers expose infrastructure failures, protect stored payloads from inspection mutations, and expire successful and failed records separately. Unknown/expired records return null. |
-| 6 | Startup failure and later idle-worker failure each notify the host once, without needing a failing submission. Future callers see the original error; connections close. Job errors and ordinary shutdown do not trigger the worker-error hook. |
+| 6 | Startup failure and later idle-worker failure each notify the host once, without needing a failing submission. Future callers see the original error; connections close even when reporting throws, rejects, or stalls. Unexpected clean worker exit releases pending result waits; an async observer can await shutdown without deadlocking. Job errors and ordinary shutdown do not trigger the worker-error hook. |
 
 ## Interfaces used by the tests
 
-Timing, schedule handles, shutdown deadlines, inspection, and failure retention
-are implemented. Worker error reporting remains a draft interface for future
-implementation. Refine that spelling while retaining the behavior above.
+Timing, schedule handles, shutdown deadlines, inspection, failure retention,
+and worker error reporting are implemented.
 
 - `job(input, { after: "500ms" })` and `job(input, { at: isoTimestamp })` return existing job handles.
 - `job(input, { every: "1h" })`, `{ daily: "09:00", timezone }`, and `{ cron, timezone }`
@@ -48,7 +47,8 @@ implementation. Refine that spelling while retaining the behavior above.
   `output` or `error` when terminal. Status is queued/running/succeeded/failed.
 - `RedisBackend({ resultTTLSeconds, failureTTLSeconds, ... })` separates ordinary
   successful-result retention from failed-execution history.
-- `createJobSystem({ onError(error), ... })` reports infrastructure failure to the host.
+- `createJobSystem({ onError(error), ... })` reports the first startup or terminal worker
+  failure to the host. Reporting errors are ignored; shutdown does not wait for async reporting.
 
 The calendar helper is part of test 1, not another top-level test. Its clock is
 isolated in a child process; Redis scenarios use actual time and process lifetimes.

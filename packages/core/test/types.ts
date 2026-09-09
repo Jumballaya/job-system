@@ -57,7 +57,11 @@ defineJob({
   metadata: { priority: 1 },
   handler: (input: string) => input,
 });
-const jobs = createJobSystem({ container, jobs: { add, label }, backend: new MemoryBackend() });
+const jobs = createJobSystem({ container, jobs: { add, label }, backend: new MemoryBackend(), async onError(error) {
+  // @ts-expect-error Worker failures may be any thrown value; narrow before inspecting.
+  error.message;
+  if (error instanceof Error) console.error(error.message);
+} });
 const inspection: Promise<JobRecord | null> = jobs.get("persisted-id");
 async function inspect() {
   const record = await inspection;

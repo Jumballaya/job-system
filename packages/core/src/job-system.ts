@@ -163,15 +163,21 @@ export class JobSystem {
   private readonly shutdown = new AbortController();
   private readonly executionShutdown = new AbortController();
   private readonly shutdownTimeoutMs: number;
+  private readonly onError?: (error: unknown) => void;
   private worker?: Promise<JobWorker>;
   private closing?: Promise<void>;
 
-  constructor(private readonly container: Container, jobs: Readonly<Record<string, AnyJob>>, options: { backend: JobBackend; codec?: JobCodec; concurrency?: number; worker?: boolean; shutdownTimeoutMs?: number }) {
+  constructor(private readonly container: Container, jobs: Readonly<Record<string, AnyJob>>, options: {
+    backend: JobBackend; codec?: JobCodec; concurrency?: number; worker?: boolean; shutdownTimeoutMs?: number;
+    onError?: (error: unknown) => void;
+  }) {
     if (!options?.backend) throw new Error("A job backend is required");
     this.backend = options.backend;
     this.codec = options.codec ?? new JsonCodec();
     this.concurrency = options.concurrency ?? 1;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 30_000;
+    this.onError = options.onError;
+    if (this.onError !== undefined && typeof this.onError !== "function") throw new Error("onError must be a function");
     if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 0 || this.shutdownTimeoutMs > 2_147_483_647) {
       throw new Error("shutdownTimeoutMs must be an integer between 0 and 2147483647");
     }
@@ -198,8 +204,7 @@ export class JobSystem {
     }
     if (options.worker !== false) {
       this.worker = this.openWorker();
-      // Startup can fail before any caller arrives; retain the failure for calls and shutdown.
-      void this.worker.catch((error: unknown) => this.shutdown.abort(error));
+      void this.worker.catch((error: unknown) => this.workerFailed(error));
     }
   }
 
@@ -311,6 +316,13 @@ export class JobSystem {
     this.shutdown.signal.throwIfAborted();
   }
 
+  private workerFailed(error: unknown): void {
+    if (this.shutdown.signal.aborted) return;
+    this.shutdown.abort(error);
+    // Observe outside the worker lifecycle: hooks can await close, and hook failures cannot replace the cause.
+    void Promise.resolve().then(() => this.onError?.(error)).catch(() => {});
+  }
+
   private async openWorker(): Promise<JobWorker> {
     const concurrencyByJob = Object.fromEntries([...this.catalog]
       .filter(([, entry]) => Number.isFinite(entry.metadata.concurrency))
@@ -321,8 +333,8 @@ export class JobSystem {
     );
     // Observe terminal worker failure once, so pending and future submissions cannot wait on a dead worker.
     void worker.done.then(
-      () => this.shutdown.abort(new Error("Job worker stopped")),
-      (error: unknown) => this.shutdown.abort(error),
+      () => this.workerFailed(new Error("Job worker stopped")),
+      (error: unknown) => this.workerFailed(error),
     );
     return worker;
   }
@@ -391,6 +403,9 @@ export function createJobSystem(options: {
   shutdownTimeoutMs?: number;
   /** False submits to remote workers without starting a local worker or resolving dependencies. */
   worker?: boolean;
+  /** Reports the first startup/terminal worker failure; job failures and ordinary shutdown are excluded.
+   * Async observers are supported; their errors are ignored and close does not wait for them. */
+  onError?: (error: unknown) => void;
 }): JobSystem {
   return new JobSystem(options.container ?? new Container(), options.jobs, options);
 }

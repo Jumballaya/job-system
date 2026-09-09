@@ -236,6 +236,23 @@ calls and pending results; create a new system after worker failure. A container
 optional for jobs without dependencies and for submit-only systems. Background startup
 failures are retained and reject subsequent calls and `close()`.
 
+Provide an optional system `onError` to hear about startup or terminal worker failure
+even while idle:
+
+```ts
+const jobs = createJobSystem({
+  jobs: { updateMemory },
+  backend: new RedisBackend(redisOptions),
+  onError(error) { console.error("Job worker failed", error); },
+});
+```
+
+The hook receives the original failure once. An unexpected clean worker exit reports
+`Error("Job worker stopped")`. Job-handler errors, transient backend reconnects, and
+shutdown initiated by `close()` don't trigger it. Async hooks may call `close()`;
+shutdown never waits for reporting. Hook exceptions/rejections are ignored so they
+cannot replace the worker failure; handle delivery failures inside your reporter.
+
 ## Run workers separately
 
 In an API or other producer process, register the catalog with `worker: false`:
@@ -545,14 +562,13 @@ terminal failures, cancellation and shutdown. No tests or infrastructure setup
 are added to the tiny app's source directory.
 
 The six [V1 replacement acceptance contracts](packages/core/test/acceptance/README.md)
-run separately; #1–#5 pass. #6 (worker failure reporting) intentionally remains
-failing until implemented:
+run separately; all six pass:
 
 ```sh
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance
 ```
 
 This suite owns its Redis and worker processes. Each numbered gap has one top-level
-test; the acceptance README documents its scenario and draft interface assumptions.
+test; the acceptance README documents its scenario and interfaces.
 
 The earlier DI review in `docs/reviews` is historical and predates this API.

@@ -250,10 +250,12 @@ test("5 — a fresh process can inspect queued, running, retried, and retained f
 });
 
 test("6 — startup and idle-worker failures reach one error hook without callers, duplicates, or leaked resources", { timeout: 10_000 }, async () => {
-  for (const phase of ["startup", "idle"]) {
+  for (const [phase, observer] of ["startup", "idle"].flatMap((phase) =>
+    ["reports", "throws", "rejects", "waits"].map((observer) => [phase, observer]))) {
     const fatal = new Error(`${phase} processing failure`);
     const stopped = Promise.withResolvers();
     const notifications = [];
+    const observerFinished = Promise.withResolvers();
     let closes = 0;
     class Backend extends MemoryBackend {
       async work(...args) {
@@ -264,7 +266,12 @@ test("6 — startup and idle-worker failures reach one error hook without caller
       async close() { closes++; await super.close(); }
     }
     const job = defineJob({ deps: [], handler: (input) => input });
-    const jobs = createJobSystem({ jobs: { job }, backend: new Backend(), onError: (error) => notifications.push(error) });
+    const jobs = createJobSystem({ jobs: { job }, backend: new Backend(), onError(error) {
+      notifications.push(error);
+      if (observer === "throws") throw new Error("reporter threw");
+      if (observer === "rejects") return Promise.reject(new Error("reporter rejected"));
+      if (observer === "waits") return observerFinished.promise;
+    } });
     try {
       if (phase === "idle") {
         assert.equal(await job("healthy").result(), "healthy");
@@ -278,9 +285,43 @@ test("6 — startup and idle-worker failures reach one error hook without caller
     } finally {
       try { await jobs.close(); }
       catch (error) { assert.equal(error, fatal); }
+      observerFinished.resolve();
     }
     assert.equal(closes, 1);
     assert.deepEqual(notifications, [fatal], "shutdown reported the same fatal error again");
+  }
+  // A worker can exit without rejecting; its observer can own shutdown without joining its own lifecycle.
+  const stopped = Promise.withResolvers();
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const reported = Promise.withResolvers();
+  const closed = Promise.withResolvers();
+  let notifications = 0;
+  class StoppingBackend extends MemoryBackend {
+    async work(...args) {
+      const worker = await super.work(...args);
+      return { ...worker, done: stopped.promise };
+    }
+  }
+  const blocked = defineJob({ deps: [], async handler() { entered.resolve(); await release.promise; } });
+  const stopping = createJobSystem({ jobs: { blocked }, backend: new StoppingBackend(), async onError(error) {
+    notifications++;
+    reported.resolve(error);
+    try { await stopping.close(); closed.resolve(); }
+    catch (error) { closed.reject(error); }
+  } });
+  try {
+    const pending = assert.rejects(blocked(null).result(), /Job worker stopped/);
+    await entered.promise;
+    stopped.resolve();
+    assert.match((await reported.promise).message, /Job worker stopped/);
+    await pending;
+    release.resolve();
+    await closed.promise;
+    assert.equal(notifications, 1);
+  } finally {
+    release.resolve();
+    await stopping.close();
   }
   const normal = [];
   const broken = defineJob({ deps: [], handler() { throw new Error("application failure"); }, metadata: { retries: { attempts: 1 } } });
