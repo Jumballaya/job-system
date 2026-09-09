@@ -79,12 +79,20 @@ export const sendEmail = defineJob({
 | `timeout` | 5 minutes | Requests cancellation from delivery onward; active work must settle before failure/retry. `Infinity` disables. |
 | `concurrency` | unlimited | Simultaneous executions of this job in one process, within the system's own limit. A waiting execution holds its worker slot. |
 | `key` | none | Derives a dedupe key from the input. Calling the job while a job with that key is queued or running returns the active job's handle instead of a new one. |
+| `idempotencyKey` | none | Identifies one operation permanently: identical submissions reuse its ID and outcome, including after completion. Mutually exclusive with `key`. |
 
 Any thrown error is retried until attempts run out, except `NonRetryableError`,
 exported from `core`, which fails immediately. Failures after the handler
 succeeded, such as an `onSuccess` hook error, never retry. Handlers with external
-effects should be idempotent per `jobId`, because a retry repeats the whole handler.
+effects should use a persisted operation ID, because a retry repeats the whole handler.
 Invalid metadata is rejected by `defineJob`.
+
+For durable operations, declare `metadata.idempotencyKey: input => input.operationId`
+and call the job normally. Include tenant identity in the key when applicable.
+Redis retains these operations and their outcomes without expiry; memory retains
+them only until the backend closes. A different input for the same operation rejects
+with `IdempotencyConflictError`. See [durable idempotency](docs/idempotency.md) for
+downstream keys, database transactions, and the crash-recovery guarantees.
 
 ## Assemble the system
 
@@ -231,11 +239,12 @@ releases backend resources. Closing is idempotent and prevents new runs. It cann
 retract work already accepted remotely, and draining can wait indefinitely for a
 handler that never finishes. Closing an unused system does not start a worker.
 
-The memory backend retains results for 60 seconds and at most 1,000 completed jobs;
+For jobs without `idempotencyKey`, the memory backend retains results for 60 seconds and at most 1,000 completed jobs;
 configure its age using `new MemoryBackend({ resultTTLms: ... })`. Redis retains
 results for 300 seconds by default (`resultTTLSeconds`), enforced on reads even
-when BullMQ's physical cleanup is deferred. Unknown or expired results reject with
-`ResultUnavailableError`. This is result retention, not permanent job history.
+when physical cleanup is deferred. Unknown or expired results reject with
+`ResultUnavailableError`. Idempotent operations are exempt from both age and count
+cleanup; their retained records grow with the number of distinct operation keys.
 
 ## Serialization and cancellation
 
@@ -244,8 +253,10 @@ arrays, strings, booleans, finite numbers, null, and a top-level undefined value
 It rejects values whose meaning JSON would change: Date/class instances, functions,
 bigints, symbols, nonfinite numbers, negative zero, sparse arrays, extra array
 properties, nested undefined, and cycles. Record prototype identity is not part of
-the JSON data contract. A custom `codec` can support additional values; its
+the JSON data contract. Object keys are encoded in sorted order so equivalent
+records do not produce false idempotency conflicts. A custom `codec` can support additional values; its
 `encode(value): string` and `decode(encoded): unknown` must preserve those values.
+Its encoding must also be deterministic when used with idempotency keys.
 
 Only an ID, job name, and encoded input cross the backend boundary. Classes,
 service instances and AbortSignal objects stay in the worker. Invalid input encoding
@@ -305,7 +316,7 @@ bounds. A network submission failure can leave acceptance uncertain.
 
 Redis recovery can execute work more than once, especially after a crash between
 an external side effect and outcome persistence. Handlers with external effects
-should use the stable job ID for application-level idempotency. Neither backend
+should pass the persisted operation ID to downstream idempotency mechanisms. Neither backend
 promises exactly-once external effects. Redis durability also depends on the Redis
 server's persistence configuration.
 
@@ -325,8 +336,11 @@ This is the entire strategy seam. Backend inputs/outputs are data-only envelopes
 core keeps catalog typing, serialization, DI, hooks, timeouts and per-job
 concurrency. A backend owns acceptance, delivery, retries, recovery, retention,
 result waiting, acknowledgments and its connections. Each message carries its
-`policy`: total attempts, backoff, and an optional dedupe key. `submit` returns the
-message's own ID, or the ID of a queued or running job that holds the same key.
+`policy`: total attempts, backoff, and an optional active dedupe key or durable
+idempotency key. Core derives a stable ID from the registration name and
+idempotency key. A backend must atomically reserve that ID, reject changed inputs,
+and retain idempotent records and terminal outcomes without ordinary result eviction.
+`submit` returns the accepted ID, or the ID of a queued or running job holding an active dedupe key.
 `work` is ready when it resolves and calls the executor with a 1-based attempt
 number. A failed outcome marked `retryable` before the final attempt is redelivered
 after `backoffDelay(policy, attempt)`, exported from `core`; any other outcome is

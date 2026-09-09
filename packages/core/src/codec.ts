@@ -1,4 +1,4 @@
-/** A codec must round-trip supported values; reject values it cannot preserve. */
+/** Round-trip supported values; stable encodings of equivalent inputs enable idempotency conflict checks. */
 export interface JobCodec {
   encode(value: unknown): string;
   decode(encoded: string): unknown;
@@ -26,7 +26,7 @@ function snapshot(value: unknown, ancestors = new Set<object>()): Json {
   try {
     if (Array.isArray(value)) return Array.from(value, (item) => snapshot(item, ancestors));
     const result: { [key: string]: Json } = Object.create(null);
-    for (const [key, item] of Object.entries(value)) result[key] = snapshot(item, ancestors);
+    for (const key of Object.keys(value).sort()) result[key] = snapshot((value as Record<string, unknown>)[key], ancestors);
     return result;
   } finally {
     ancestors.delete(value);

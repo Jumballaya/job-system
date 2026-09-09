@@ -33,13 +33,28 @@ to BullMQ so it schedules the next delivery; the final outcome is retained like 
 successful output. Executor rejection is infrastructure failure and shares the same
 attempt budget. Delivery can repeat; handlers must account for repeated side effects.
 
-Results remain available for the configured TTL after completion, including to
+Ordinary results remain available for the configured TTL after completion, including to
 new backend instances. Expired or unknown IDs reject with `ResultUnavailableError`.
-BullMQ cleans up old records opportunistically when later jobs finish; the adapter
-checks expiry on every result read even when physical cleanup has not run yet.
+The adapter scans bounded batches of completed and failed jobs on later submissions,
+removing expired ordinary records. Reads enforce expiry even before cleanup runs.
+BullMQ's queue-wide age/count removal is disabled because it can also delete records
+that individual jobs asked to retain permanently.
 Identical submissions with the same ID are idempotent before its outcome expires;
 reusing the ID for a different message rejects. A retained expired ID rejects too.
 Use a fresh ID for new work; the core job system generates these automatically.
+
+`metadata.idempotencyKey` opts a job into durable replay. Its registration name and
+operation key determine a stable custom job ID, reserved atomically by BullMQ.
+Concurrent submissions and resubmissions after completion reuse that record;
+different encoded input rejects with `IdempotencyConflictError`. The original
+delivery policy wins, including exhausted retries and terminal failures.
+These records and outcomes never expire through adapter cleanup. See
+[idempotency](idempotency.md) for the application-side effect contract.
+
+Before enabling this on an existing queue, drain workers and replace all old
+producers/workers using queue-wide age/count cleanup. Mixed versions or external
+BullMQ cleanup can erase the retained records. Deleting the queue or losing its
+Redis data also loses queue-side idempotency; retain database/provider receipts.
 
 Aborting a result wait affects only that wait. Accepted jobs continue running.
 Closing drains this backend's workers, rejects its waits, and closes its owned
@@ -56,4 +71,15 @@ JOB_SYSTEM_REDIS_PORT=16379 pnpm --filter core test
 
 Integration tests create unique queues and remove only their own queues. The suite
 includes separate producer and worker processes and a fresh reader of a completed
-result. Redis integration tests are skipped when the environment variable is absent.
+result, conflicting operation submissions, retention, and a worker killed after a
+database commit. The crash test waits for BullMQ's real stalled-worker recovery,
+usually about a minute. Redis integration tests skip without the port variable.
+
+To also test a Redis process crash and recovery from AOF, supply a local binary:
+
+```sh
+JOB_SYSTEM_REDIS_PORT=16379 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm --filter core test
+```
+
+That test owns a separate temporary Redis process, port, and data directory. It
+uses `appendfsync always`; it does not restart the server supplied by the port variable.

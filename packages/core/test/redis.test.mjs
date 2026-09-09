@@ -156,7 +156,7 @@ test("exhausted infrastructure retries reject the result without stopping the wo
     if (message.name === "broken") { calls++; throw new Error("cannot reach dependency"); }
     return success("worker remains available");
   });
-  await backend.submit({ id: "broken", name: "broken", input: "null", policy: single });
+  await backend.submit({ id: "broken", name: "broken", input: "null", policy: triple });
   await assert.rejects(backend.result("broken"), /infrastructure failed: cannot reach dependency/);
   assert.equal(calls, 3);
   await backend.submit({ id: "healthy", name: "healthy", input: "null", policy: single });

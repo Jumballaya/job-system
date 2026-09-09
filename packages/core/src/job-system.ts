@@ -1,6 +1,6 @@
 import { Container } from "./dep-inject.js";
 import type { Constructor } from "./dep-inject.js";
-import { JobExecutionError, NonRetryableError } from "./backend.js";
+import { JobExecutionError, NonRetryableError, prepareSubmission } from "./backend.js";
 import type { JobBackend, JobFailure, JobMessage, JobOutcome, JobPolicy, JobWorker, WaitOptions } from "./backend.js";
 import { JsonCodec } from "./codec.js";
 import type { JobCodec } from "./codec.js";
@@ -23,15 +23,21 @@ export interface JobContext {
 export type Backoff = "fixed" | "exponential" | { readonly type: "fixed" | "exponential"; readonly delay: number };
 
 /** Every field has a production default; see `defaultMetadata`. */
-export interface JobMetadata<Input = unknown> {
+export type JobMetadata<Input = unknown> = {
   readonly retries?: { readonly attempts?: number; readonly backoff?: Backoff };
   /** Milliseconds from delivery until cancellation is requested; active work must settle before retry. */
   readonly timeout?: number;
   /** Simultaneous executions of this job within one process; the system's concurrency still applies. */
   readonly concurrency?: number;
+} & ({
   /** Derives a key scoped to this job's registration; submitting while active reuses that job. */
   readonly key?: (input: NoInfer<Input>) => string;
-}
+  readonly idempotencyKey?: never;
+} | {
+  readonly key?: never;
+  /** Replays the same operation, including completed outcomes; include tenant identity when applicable. */
+  readonly idempotencyKey: (input: NoInfer<Input>) => string;
+});
 
 export interface JobDefinition<Deps extends readonly Constructor[], Input, Output> {
   readonly deps: Deps;
@@ -80,6 +86,7 @@ type ResolvedMetadata = {
   readonly timeout: number;
   readonly concurrency: number;
   readonly key?: (input: unknown) => string;
+  readonly idempotencyKey?: (input: unknown) => string;
 };
 
 /** Three attempts a second or so apart, a five-minute ceiling per attempt, and no dedupe unless keyed. */
@@ -98,6 +105,7 @@ function resolveMetadata(metadata: JobMetadata<any> = {}): ResolvedMetadata {
     timeout: metadata.timeout ?? defaultMetadata.timeout,
     concurrency: metadata.concurrency ?? defaultMetadata.concurrency,
     ...(metadata.key ? { key: metadata.key } : {}),
+    ...(metadata.idempotencyKey !== undefined ? { idempotencyKey: metadata.idempotencyKey } : {}),
   };
   const invalid = (field: string, requirement: string) => new Error(`Job metadata ${field} must be ${requirement}`);
   if (!Number.isSafeInteger(resolved.attempts) || resolved.attempts < 1) throw invalid("retries.attempts", "a positive integer");
@@ -108,6 +116,8 @@ function resolveMetadata(metadata: JobMetadata<any> = {}): ResolvedMetadata {
     throw invalid("concurrency", "a positive integer or Infinity");
   }
   if (resolved.key !== undefined && typeof resolved.key !== "function") throw invalid("key", "a function of the input");
+  if (resolved.idempotencyKey !== undefined && typeof resolved.idempotencyKey !== "function") throw invalid("idempotencyKey", "a function of the input");
+  if (metadata.key !== undefined && metadata.idempotencyKey !== undefined) throw new Error("Choose key or idempotencyKey, not both");
   return Object.freeze(resolved);
 }
 
@@ -214,10 +224,16 @@ export class JobSystem {
       this.assertOpen();
       const { metadata } = this.catalog.get(name)!;
       const key = metadata.key?.(input);
+      const idempotencyKey = metadata.idempotencyKey?.(input);
       if (key !== undefined && (typeof key !== "string" || !key)) throw new Error(`Job "${name}" key must be a nonempty string`);
+      if (metadata.idempotencyKey && (typeof idempotencyKey !== "string" || !idempotencyKey)) throw new Error(`Job "${name}" idempotencyKey must be a nonempty string`);
       // Tuple encoding prevents collisions between job names and user keys containing separators.
-      const policy: JobPolicy = { attempts: metadata.attempts, backoff: metadata.backoff, ...(key !== undefined ? { key: JSON.stringify([name, key]) } : {}) };
-      const message: JobMessage = Object.freeze({ id: crypto.randomUUID(), name, input: this.codec.encode(input), policy });
+      const policy: JobPolicy = {
+        attempts: metadata.attempts, backoff: metadata.backoff,
+        ...(key !== undefined ? { key: JSON.stringify([name, key]) } : {}),
+        ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
+      };
+      const message: JobMessage = prepareSubmission({ id: crypto.randomUUID(), name, input: this.codec.encode(input), policy });
       await (this.worker ??= this.openWorker());
       this.assertOpen();
       const id = await this.backend.submit(message);

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /** Delivery policy fixed at submission; backends enforce it, core decides retryability per attempt. */
 export interface JobPolicy {
   /** Total attempts including the first; at least 1. */
@@ -5,6 +7,8 @@ export interface JobPolicy {
   readonly backoff: { readonly type: "fixed" | "exponential"; readonly delay: number };
   /** While a job with this key is queued or running, submitting again returns that job's ID. */
   readonly key?: string;
+  /** Stable operation key, scoped by name. Retain its identity, input, and terminal outcome without expiry. */
+  readonly idempotencyKey?: string;
 }
 
 export interface JobMessage {
@@ -46,7 +50,7 @@ export type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: nu
 
 /** Own delivery and retained outcomes. Recover infrastructure failures without promising exactly-once effects. */
 export interface JobBackend {
-  /** Accept the message and return the ID to wait on: the message's own, or an active job sharing its key. */
+  /** Accept or replay work; idempotency keys reject changed inputs and survive result cleanup. */
   submit(message: JobMessage): Promise<string>;
   /** Return a retained or future outcome; reject if unknown/expired, aborted, or closed. */
   result(id: string, options?: WaitOptions): Promise<JobOutcome>;
@@ -54,6 +58,34 @@ export interface JobBackend {
   work(execute: JobExecutor, options?: WorkerOptions): Promise<JobWorker>;
   /** Drain owned workers, reject pending waits, and release owned connections. */
   close(): Promise<void>;
+}
+
+/** Snapshot policy and derive durable identity before the backend accepts any work. */
+export function prepareSubmission(message: JobMessage): JobMessage {
+  const { key, idempotencyKey } = message.policy;
+  if (idempotencyKey !== undefined && (typeof idempotencyKey !== "string" || !idempotencyKey)) {
+    throw new Error("Job idempotencyKey must be a nonempty string");
+  }
+  if (key !== undefined && idempotencyKey !== undefined) {
+    throw new Error("Choose key for active coalescing or idempotencyKey for durable replay, not both");
+  }
+  const id = idempotencyKey === undefined ? message.id
+    : `operation-${createHash("sha256").update(JSON.stringify([message.name, idempotencyKey])).digest("hex")}`;
+  return Object.freeze({ ...message, id, policy: Object.freeze({ ...message.policy, backoff: Object.freeze({ ...message.policy.backoff }) }) });
+}
+
+export function assertSameSubmission(stored: JobMessage, incoming: JobMessage): void {
+  if (stored.name === incoming.name && stored.input === incoming.input &&
+    stored.policy.idempotencyKey === incoming.policy.idempotencyKey) return;
+  if (incoming.policy.idempotencyKey !== undefined) throw new IdempotencyConflictError(incoming.id);
+  throw new Error(`Job ID already belongs to another submission: ${incoming.id}`);
+}
+
+export class IdempotencyConflictError extends Error {
+  constructor(public readonly jobId: string) {
+    super(`Idempotency key already belongs to a different submission: ${jobId}`);
+    this.name = "IdempotencyConflictError";
+  }
 }
 
 /** Milliseconds to wait after the given failed attempt before the next delivery. */

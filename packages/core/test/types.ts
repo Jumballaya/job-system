@@ -59,6 +59,24 @@ defineJob({
 });
 const jobs = createJobSystem({ container, jobs: { add, label }, backend: new MemoryBackend() });
 
+defineJob({
+  deps: [Counter],
+  handler: (input: { operationId: string; amount: number }, counter) => counter.add(input.amount),
+  metadata: { idempotencyKey: (input) => input.operationId },
+});
+defineJob({
+  deps: [],
+  handler: (input: string) => input,
+  // @ts-expect-error Coalescing cannot discard a distinct durable operation.
+  metadata: { key: () => "active", idempotencyKey: () => "durable" },
+});
+defineJob({
+  deps: [],
+  handler: (input: string) => input,
+  // @ts-expect-error Operation keys must derive from the declared input.
+  metadata: { idempotencyKey: (input: number) => String(input) },
+});
+
 const handle: Promise<JobHandle<number>> = add({ amount: 1 });
 const count: Promise<number> = add({ amount: 1 }).result();
 const text: Promise<string> = label("hello").result();

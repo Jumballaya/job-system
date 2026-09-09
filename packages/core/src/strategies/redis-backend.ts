@@ -1,10 +1,12 @@
 import { Queue, Worker } from "bullmq";
 import type { Job, RedisOptions } from "bullmq";
-import { ResultUnavailableError } from "../backend.js";
+import { assertSameSubmission, prepareSubmission, ResultUnavailableError } from "../backend.js";
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 
 const redisRequestTimeoutMs = 5_000;
 const resultPollIntervalMs = 50;
+const cleanupBatchSize = 100;
+type StoredMessage = JobMessage & { readonly resultTTLSeconds?: number };
 
 export interface RedisBackendOptions {
   readonly queue: string;
@@ -48,12 +50,14 @@ function applicationId(redis: string): string {
 
 /** BullMQ owns delivery and retained outcomes; each backend owns its connections and workers. */
 export class RedisBackend implements JobBackend {
-  private readonly queue: Queue<JobMessage, JobOutcome>;
+  private readonly queue: Queue<StoredMessage, JobOutcome>;
   private readonly connection: RedisOptions;
   private readonly retention: number;
   private readonly workers = new Set<JobWorker>();
   private readonly closed = new AbortController();
   private closing?: Promise<void>;
+  private cleanup?: Promise<void>;
+  private readonly cleanupOffsets = { completed: 0, failed: 0 };
 
   constructor(options: RedisBackendOptions) {
     if (!options.queue.trim() || options.queue.includes(":")) {
@@ -75,8 +79,9 @@ export class RedisBackend implements JobBackend {
     this.queue = new Queue(options.queue, {
       connection: { ...this.connection, maxRetriesPerRequest: 1, commandTimeout: redisRequestTimeoutMs },
       defaultJobOptions: {
-        removeOnComplete: { age: this.retention },
-        removeOnFail: { age: this.retention },
+        // BullMQ age/count cleanup sweeps whole terminal sets, including other jobs marked keep-forever.
+        removeOnComplete: false,
+        removeOnFail: false,
       },
     });
     // Redis reconnect errors also reject requests; EventEmitter still needs a listener.
@@ -90,10 +95,11 @@ export class RedisBackend implements JobBackend {
       typeof message.policy !== "object" || message.policy === null) {
       throw new Error("A job message requires an ID, a name, a serialized input, and a policy");
     }
+    message = prepareSubmission(message);
     const id = redisId(message.id);
     const { attempts, backoff, key } = message.policy;
     const signal = AbortSignal.any([this.closed.signal, AbortSignal.timeout(redisRequestTimeoutMs)]);
-    const added = await abortable(this.queue.add(message.name, message, {
+    const added = await abortable(this.queue.add(message.name, { ...message, resultTTLSeconds: this.retention }, {
       jobId: id,
       attempts,
       backoff: { type: backoff.type, delay: backoff.delay },
@@ -104,9 +110,8 @@ export class RedisBackend implements JobBackend {
     const stored = await abortable(this.queue.getJob(id), signal);
     if (!stored) throw new ResultUnavailableError(message.id);
     this.assertRetained(stored, message.id);
-    if (stored.data.name !== message.name || stored.data.input !== message.input) {
-      throw new Error(`Job ID already belongs to another submission: ${message.id}`);
-    }
+    assertSameSubmission(stored.data, message);
+    await abortable(this.prune(), signal);
     return message.id;
   }
 
@@ -131,12 +136,35 @@ export class RedisBackend implements JobBackend {
     }
   }
 
-  private assertRetained(job: Job<JobMessage, JobOutcome>, id: string): void {
-    if (job.finishedOn === undefined) return;
-    // Both terminal sets share retention; BullMQ's physical age cleanup is lazy.
+  private expiresAt(job: Job<StoredMessage, JobOutcome>): number {
+    if (job.finishedOn === undefined || job.data.policy.idempotencyKey !== undefined) return Infinity;
     const policy = job.opts.removeOnComplete;
-    const retention = typeof policy === "object" && "age" in policy ? policy.age : this.retention;
-    if (Date.now() >= job.finishedOn + retention * 1_000) throw new ResultUnavailableError(id);
+    const retention = job.data.resultTTLSeconds ?? (typeof policy === "object" && "age" in policy ? policy.age : this.retention);
+    return job.finishedOn + retention * 1_000;
+  }
+
+  private assertRetained(job: Job<StoredMessage, JobOutcome>, id: string): void {
+    if (Date.now() >= this.expiresAt(job)) throw new ResultUnavailableError(id);
+  }
+
+  private prune(): Promise<void> {
+    this.cleanup ??= (async () => {
+      const signal = AbortSignal.any([this.closed.signal, AbortSignal.timeout(redisRequestTimeoutMs)]);
+      for (const state of ["completed", "failed"] as const) {
+        const offset = this.cleanupOffsets[state];
+        const jobs = await abortable(this.queue.getJobs([state], offset, offset + cleanupBatchSize - 1, true), signal);
+        let removed = 0;
+        for (const job of jobs) {
+          if (Date.now() < this.expiresAt(job)) continue;
+          signal.throwIfAborted();
+          await abortable(job.remove(), signal);
+          removed++;
+        }
+        // Cycle through permanent records too; concurrent removals are caught on the next pass.
+        this.cleanupOffsets[state] = jobs.length < cleanupBatchSize ? 0 : offset + jobs.length - removed;
+      }
+    })().finally(() => { this.cleanup = undefined; });
+    return this.cleanup;
   }
 
   public async work(execute: JobExecutor, options?: WorkerOptions): Promise<JobWorker> {
@@ -195,6 +223,7 @@ export class RedisBackend implements JobBackend {
     this.closed.abort(new Error("Redis backend is closed"));
     this.closing = (async () => {
       const results = await Promise.allSettled([...this.workers].map((worker) => worker.close()));
+      await this.cleanup?.catch(() => {});
       await this.queue.close();
       const failure = results.find((result) => result.status === "rejected");
       if (failure?.status === "rejected") throw failure.reason;

@@ -1,4 +1,4 @@
-import { backoffDelay, ResultUnavailableError } from "../backend.js";
+import { assertSameSubmission, backoffDelay, prepareSubmission, ResultUnavailableError } from "../backend.js";
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 
 const MAX_RETAINED_RESULTS = 1_000;
@@ -23,7 +23,7 @@ type Consumer = {
   handle: JobWorker;
 };
 
-/** Process-local FIFO jobs with bounded retained results; share no external connections. */
+/** Process-local FIFO jobs; idempotency records last until close, ordinary results have bounded retention. */
 export class MemoryBackend implements JobBackend {
   private readonly entries = new Map<string, Entry>();
   /** Active entries by dedupe key; cleared when the entry completes. */
@@ -41,12 +41,11 @@ export class MemoryBackend implements JobBackend {
 
   public async submit(message: JobMessage): Promise<string> {
     this.assertOpen();
+    message = prepareSubmission(message);
     this.prune();
     const existing = this.entries.get(message.id);
     if (existing) {
-      if (existing.message.name !== message.name || existing.message.input !== message.input) {
-        throw new Error(`Job ID already belongs to a different submission: ${message.id}`);
-      }
+      assertSameSubmission(existing.message, message);
       return message.id;
     }
     const key = message.policy.key;
@@ -184,7 +183,7 @@ export class MemoryBackend implements JobBackend {
 
   private complete(entry: Entry, completion: Completion): void {
     entry.completion = completion;
-    entry.expiresAt = Date.now() + this.resultTTLms;
+    if (entry.message.policy.idempotencyKey === undefined) entry.expiresAt = Date.now() + this.resultTTLms;
     const key = entry.message.policy.key;
     if (key !== undefined && this.keyed.get(key) === entry) this.keyed.delete(key);
     for (const waiter of [...entry.waiters]) waiter(completion);
