@@ -2,11 +2,13 @@ import { Queue, Worker } from "bullmq";
 import type { Job, RedisOptions } from "bullmq";
 import { assertSameSubmission, prepareSubmission, ResultUnavailableError } from "../backend.js";
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
+import { occurrence, scheduleId, validateRule } from "../scheduling.js";
+import type { JobSchedules, ScheduleRule } from "../scheduling.js";
 
 const redisRequestTimeoutMs = 5_000;
 const resultPollIntervalMs = 50;
 const cleanupBatchSize = 100;
-type StoredMessage = JobMessage & { readonly resultTTLSeconds?: number };
+type StoredMessage = JobMessage & { readonly resultTTLSeconds?: number; readonly schedule?: ScheduleRule };
 
 export interface RedisBackendOptions {
   readonly queue: string;
@@ -39,9 +41,11 @@ function pause(signal: AbortSignal): Promise<void> {
   });
 }
 
-// Prefix and escaping make every application ID legal as a BullMQ custom ID.
+// Recurring executions already have BullMQ IDs; ordinary IDs are escaped custom IDs.
 const idPrefix = "job-";
+const recurringId = /^repeat:schedule-[a-f0-9]{64}:\d+$/;
 function redisId(id: string): string {
+  if (recurringId.test(id)) return id;
   return `${idPrefix}${encodeURIComponent(id)}`;
 }
 function applicationId(redis: string): string {
@@ -58,6 +62,45 @@ export class RedisBackend implements JobBackend {
   private closing?: Promise<void>;
   private cleanup?: Promise<void>;
   private readonly cleanupOffsets = { completed: 0, failed: 0 };
+  public readonly schedules: JobSchedules = {
+    upsert: async (message, rule) => {
+      this.closed.signal.throwIfAborted();
+      message = prepareSubmission(message);
+      rule = validateRule(rule);
+      const id = scheduleId(message);
+      await this.setSchedule(id, message, rule);
+      return id;
+    },
+    update: async (id, rule) => {
+      this.closed.signal.throwIfAborted();
+      rule = validateRule(rule);
+      const stored = await abortable(this.queue.getJobScheduler(id), this.requestSignal());
+      if (!stored?.template?.data) throw new Error(`Schedule not found: ${id}`);
+      await this.setSchedule(id, stored.template.data, rule);
+    },
+    remove: async (id) => {
+      this.closed.signal.throwIfAborted();
+      await abortable(this.queue.removeJobScheduler(id), this.requestSignal());
+    },
+  };
+
+  private requestSignal(): AbortSignal {
+    return AbortSignal.any([this.closed.signal, AbortSignal.timeout(redisRequestTimeoutMs)]);
+  }
+
+  private async setSchedule(id: string, message: JobMessage, rule: ScheduleRule): Promise<void> {
+    const signal = this.requestSignal();
+    const existing = await abortable(this.queue.getJobScheduler(id), signal);
+    if (existing?.template?.data && JSON.stringify(existing.template.data.schedule) === JSON.stringify(rule) &&
+      JSON.stringify(existing.template.data.policy) === JSON.stringify(message.policy)) return;
+    const repeat = "every" in rule ? { every: rule.every, startDate: Date.now() + rule.every }
+      : { pattern: rule.cron, tz: rule.timezone };
+    await abortable(this.queue.upsertJobScheduler(id, repeat, {
+      name: message.name,
+      data: { ...message, schedule: rule, resultTTLSeconds: this.retention },
+      opts: { attempts: message.policy.attempts, backoff: { ...message.policy.backoff }, removeOnComplete: false, removeOnFail: false },
+    }), signal);
+  }
 
   constructor(options: RedisBackendOptions) {
     if (!options.queue.trim() || options.queue.includes(":")) {
@@ -96,6 +139,7 @@ export class RedisBackend implements JobBackend {
       throw new Error("A job message requires an ID, a name, a serialized input, and a policy");
     }
     message = prepareSubmission(message);
+    if (recurringId.test(message.id)) throw new Error("Job ID is reserved for a scheduled occurrence");
     const id = redisId(message.id);
     const { attempts, backoff, key } = message.policy;
     const signal = AbortSignal.any([this.closed.signal, AbortSignal.timeout(redisRequestTimeoutMs)]);
@@ -103,6 +147,7 @@ export class RedisBackend implements JobBackend {
       jobId: id,
       attempts,
       backoff: { type: backoff.type, delay: backoff.delay },
+      ...(message.availableAt !== undefined ? { delay: Math.max(0, message.availableAt - Date.now()) } : {}),
       // Simple deduplication holds the key while the job is queued, delayed, or active.
       ...(key !== undefined ? { deduplication: { id: key } } : {}),
     }), signal);
@@ -177,7 +222,10 @@ export class RedisBackend implements JobBackend {
     const worker = new Worker<JobMessage, JobOutcome>(this.queue.name, async (job) => {
       // BullMQ counts previous failures in attemptsMade; a thrown retryable failure lets it apply the backoff.
       const attempt = job.attemptsMade + 1;
-      const outcome = await execute(job.data, execution.signal, attempt);
+      const message = job.id && recurringId.test(job.id) ? occurrence(job.data, job.id) : job.data;
+      // Recurrence can run forever without another producer submission to trigger retention cleanup.
+      if (message !== job.data) await this.prune();
+      const outcome = await execute(message, execution.signal, attempt);
       if (outcome.status === "failed" && outcome.retryable && attempt < (job.opts.attempts ?? 1)) {
         throw new Error(outcome.error.message);
       }

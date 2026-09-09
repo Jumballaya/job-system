@@ -47,8 +47,19 @@ test("1 — delayed delivery and editable schedules survive producer, worker, an
   await manager.request("update", { id: schedules[0].id, timing: { every: "100ms" } });
   const before = replacement.effects("hourly").length;
   await eventually(() => replacement.effects("hourly"), (events) => events.length >= before + 4, "Schedule update did not change delivery cadence", 1_000);
+  const laterToday = new Date(Date.now() + 6 * 60 * 60 * 1_000).toISOString().slice(11, 16);
+  await manager.request("update", { id: schedules[0].id, timing: { daily: laterToday, timezone: "UTC" } });
+  await pause(150); // Let an occurrence already claimed during the update finish.
+  const afterCalendarChange = replacement.effects("hourly").length;
+  await pause(250);
+  assert.equal(replacement.effects("hourly").length, afterCalendarChange, "switching to a calendar left the old interval running");
+  await manager.request("update", { id: schedules[0].id, timing: { cron: "* * * * * *", timezone: "UTC" } });
+  const calendarRuns = await eventually(() => replacement.effects("hourly").slice(afterCalendarChange),
+    (events) => events.length >= 2, "Changing from daily to cron did not resume calendar delivery");
+  assert.ok(calendarRuns[1].at - calendarRuns[0].at >= 800, "the old interval survived a calendar update");
   await manager.request("remove", { id: schedules[0].id });
   await manager.request("remove", { id: schedules[0].id });
+  await assert.rejects(manager.request("update", { id: schedules[0].id, timing: { every: "100ms" } }), /Schedule not found/);
   await replacement.exit();
   await manager.exit();
   await server.restart();

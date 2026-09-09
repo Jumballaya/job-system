@@ -43,7 +43,7 @@ attempt budget. Delivery can repeat; handlers must account for repeated side eff
 
 Ordinary results remain available for the configured TTL after completion, including to
 new backend instances. Expired or unknown IDs reject with `ResultUnavailableError`.
-The adapter scans bounded batches of completed and failed jobs on later submissions,
+The adapter scans bounded batches of completed and failed jobs on later submissions and recurring deliveries,
 removing expired ordinary records. Reads enforce expiry even before cleanup runs.
 BullMQ's queue-wide age/count removal is disabled because it can also delete records
 that individual jobs asked to retain permanently.
@@ -69,6 +69,22 @@ Closing drains this backend's workers, rejects its waits, and closes its owned
 connections. Other processes and accepted queued jobs are unaffected. Redis
 requests and worker startup have a five-second bound; active handlers must settle
 for graceful worker shutdown to finish.
+
+## Scheduling
+
+The [timing API](../README.md#delays-and-schedules) uses BullMQ delayed jobs and
+native Job Schedulers. No separate scheduler process or application timer is needed.
+Schedule identity hashes the catalog name and encoded input; concurrent producers
+upsert the same Redis registration. Identical registration leaves its pending run
+in place. Changing an interval starts the new cadence one interval after the update;
+changing a calendar uses its next matching time. Concurrent management calls are
+last-writer-wins; coordinate competing edits in the application when order matters.
+
+BullMQ creates the successor when a worker claims an occurrence. Retries keep the
+same occurrence ID; later occurrences use different IDs. Removal deletes the
+registration and pending occurrence, leaving active occurrences and their retries
+alone. Redis persistence retains schedules across process restarts. A worker that
+was offline resumes the pending occurrence, then continues future scheduling.
 
 Build and test against an isolated Redis server:
 

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { JobSchedules } from "./scheduling.js";
 
 /** Delivery policy fixed at submission; backends enforce it, core decides retryability per attempt. */
 export interface JobPolicy {
@@ -16,6 +17,8 @@ export interface JobMessage {
   readonly name: string;
   readonly input: string;
   readonly policy: JobPolicy;
+  /** Earliest first delivery, as Unix milliseconds; retry backoff is independent. */
+  readonly availableAt?: number;
 }
 
 export interface JobFailure {
@@ -50,6 +53,8 @@ export type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: nu
 
 /** Own delivery and retained outcomes. Recover infrastructure failures without promising exactly-once effects. */
 export interface JobBackend {
+  /** Optional recurring-schedule capability; ordinary jobs need only the delivery methods below. */
+  readonly schedules?: JobSchedules;
   /** Accept or replay work; idempotency keys reject changed inputs and survive result cleanup. */
   submit(message: JobMessage): Promise<string>;
   /** Return a retained or future outcome; reject if unknown/expired, aborted, or closed. */
@@ -62,6 +67,8 @@ export interface JobBackend {
 
 /** Snapshot policy and derive durable identity before the backend accepts any work. */
 export function prepareSubmission(message: JobMessage): JobMessage {
+  if (message.availableAt !== undefined && (!Number.isSafeInteger(message.availableAt) ||
+    !Number.isFinite(new Date(message.availableAt).getTime()))) throw new Error("Job availableAt must be a valid timestamp");
   const { key, idempotencyKey } = message.policy;
   if (idempotencyKey !== undefined && (typeof idempotencyKey !== "string" || !idempotencyKey)) {
     throw new Error("Job idempotencyKey must be a nonempty string");

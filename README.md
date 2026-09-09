@@ -302,6 +302,55 @@ when physical cleanup is deferred. Unknown or expired results reject with
 `ResultUnavailableError`. Idempotent operations are exempt from both age and count
 cleanup; their retained records grow with the number of distinct operation keys.
 
+## Delays and schedules
+
+Timing belongs to a call, keeping the job definition reusable:
+
+```ts
+const delayed = await updateMemory(input, { after: "10m" });
+const output = await delayed.result();
+await updateMemory(input, { at: new Date("2026-10-01T09:00:00Z") });
+
+const schedule = await updateMemory(input, { every: "1h" });
+await schedule.update({ daily: "09:00", timezone: "America/New_York" });
+await schedule.remove();
+
+// Reopen from another process using the same Redis queue.
+await jobs.schedule(savedScheduleId).remove();
+```
+
+One-off calls return the existing execution handle. Recurrence returns a schedule
+handle with `id`, `update(timing)`, and `remove()`. Re-registering the same job and
+encoded input addresses the same schedule across producers and workers; changing
+its timing updates that registration. Store the returned ID to manage it later.
+Different input creates another schedule. `JsonCodec` canonicalizes object keys;
+custom codecs must encode equivalent inputs identically for stable schedule identity.
+
+Durations use `ms`, `s`, `m`, `h`, `d`, or `w`; intervals first run after one interval.
+`at` accepts a Date, Unix milliseconds, or an ISO timestamp with an explicit offset.
+These times specify earliest delivery; busy or offline workers can deliver later.
+`daily` uses 24-hour `HH:mm`. For more complex calendars, use
+`{ cron: "0 9 * * 1-5", timezone: "America/New_York" }`. Cron accepts five fields or
+six including seconds. Calendar rules require an explicit IANA timezone and follow
+cron-parser's DST rules. Elapsed intervals such as `"1d"` mean 24 hours.
+
+Redis persists registrations and pending deliveries. Workers resume them on restart
+without producer code running again. After downtime, the pending occurrence runs
+and scheduling continues without replaying every missed interval. Identical
+registration preserves the pending occurrence; changed timing replaces it.
+Removal is idempotent and stops future occurrences; already-started work and its
+retries finish normally. Updating a removed schedule rejects.
+
+Each occurrence gets a distinct execution ID that survives its retries. Active
+deduplication and durable idempotency apply within that occurrence, independently
+of other occurrences and ordinary calls. Use the execution ID from hooks for
+occurrence-specific external receipts. Overlap follows the existing concurrency
+settings. Idempotent occurrence records retain the same permanent retention policy
+as ordinary idempotent jobs.
+
+Memory supports the same timing API, but its schedules disappear on backend close
+or process exit. Redis durability depends on its configured persistence.
+
 ## Serialization and cancellation
 
 Both backends use the same `JsonCodec` by default. It supports plain JSON records,
@@ -380,6 +429,7 @@ server's persistence configuration.
 
 ```ts
 interface JobBackend {
+  readonly schedules?: JobSchedules;            // recurring registration and management
   submit(message: JobMessage): Promise<string>;   // the ID to wait on
   result(id: string, options?: WaitOptions): Promise<JobOutcome>;
   work(execute: JobExecutor, options?: WorkerOptions): Promise<JobWorker>;
@@ -388,7 +438,7 @@ interface JobBackend {
 type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: number) => Promise<JobOutcome>;
 ```
 
-This is the entire strategy seam. Backend inputs/outputs are data-only envelopes;
+Backend inputs/outputs are data-only envelopes;
 core keeps catalog typing, serialization, DI, hooks, timeouts and per-job
 concurrency. A backend owns acceptance, delivery, retries, recovery, retention,
 result waiting, acknowledgments and its connections. Each message carries its
@@ -404,6 +454,13 @@ retained. `JobWorker.done` exposes later terminal processing failure; `close`
 drains active callbacks. A callback rejection is an infrastructure failure, with
 recovery documented by the adapter. Unknown/expired IDs reject rather than waiting
 forever.
+
+`JobMessage.availableAt`, when present, is the earliest first delivery in Unix
+milliseconds; delay must not occupy an execution slot. Retry backoff remains
+independent. Providers supporting recurrence implement `JobSchedules.upsert`,
+`update`, and `remove` with normalized `ScheduleRule` values (elapsed milliseconds
+or cron plus timezone). The provider owns durable registration identity and
+occurrence advancement. Providers without this capability reject recurring calls.
 
 Memory and Redis/BullMQ are implemented. An SQS or RabbitMQ adapter may need an
 additional result store; a queue alone is not the complete backend. The core does
@@ -429,7 +486,8 @@ terminal failures, cancellation and shutdown. No tests or infrastructure setup
 are added to the tiny app's source directory.
 
 The six [V1 replacement acceptance contracts](packages/core/test/acceptance/README.md)
-run separately and intentionally fail until their features are implemented:
+run separately; #1 (timing and schedules) and #2 (successor delivery) pass.
+#3–#6 intentionally remain failing until implemented:
 
 ```sh
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance

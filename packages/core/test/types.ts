@@ -1,5 +1,5 @@
 import { Container, createJobSystem, defineJob, MemoryBackend } from "../dist/index.js";
-import type { JobHandle } from "../dist/index.js";
+import type { JobHandle, ScheduleHandle, Timing } from "../dist/index.js";
 
 class Counter {
   add(amount: number): number { return amount; }
@@ -80,6 +80,27 @@ defineJob({
 const handle: Promise<JobHandle<number>> = add({ amount: 1 });
 const count: Promise<number> = add({ amount: 1 }).result();
 const text: Promise<string> = label("hello").result();
+const delayed: Promise<number> = add({ amount: 1 }, { after: "10m" }).result();
+const dated: Promise<JobHandle<number>> = add({ amount: 1 }, { at: new Date() });
+const recurring: Promise<ScheduleHandle> = add({ amount: 1 }, { every: "1h" });
+const daily: Promise<ScheduleHandle> = add({ amount: 1 }, { daily: "09:00", timezone: "America/New_York" });
+const calendar: Promise<ScheduleHandle> = add({ amount: 1 }, { cron: "0 9 * * 1-5", timezone: "UTC" });
+const timing: Timing = Math.random() > 0.5 ? { after: "1s" } : { every: "1h" };
+const timed: Promise<JobHandle<number> | ScheduleHandle> = add({ amount: 1 }, timing);
+const schedule: ScheduleHandle = jobs.schedule("persisted-schedule-id");
+schedule.update({ every: "30m" });
+schedule.remove();
+// @ts-expect-error A recurrence has no single execution result.
+add({ amount: 1 }, { every: "1h" }).result();
+// @ts-expect-error Timing modes remain exclusive even when passed through a variable.
+add({ amount: 1 }, { after: "1m", every: "1h" } as const);
+// @ts-expect-error Calendar schedules require an explicit timezone.
+add({ amount: 1 }, { daily: "09:00" });
+// @ts-expect-error Durations need units.
+add({ amount: 1 }, { every: 1_000 });
+// @ts-expect-error Updating a recurring schedule requires recurring timing.
+schedule.update({ after: "1h" });
+void [delayed, dated, recurring, daily, calendar, timed];
 // @ts-expect-error Inputs stay paired with their job.
 add("wrong");
 // @ts-expect-error The handler determines the awaited output.

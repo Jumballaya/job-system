@@ -1,5 +1,7 @@
 import { assertSameSubmission, backoffDelay, prepareSubmission, ResultUnavailableError } from "../backend.js";
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
+import { nextRun, occurrence, scheduleId, validateRule } from "../scheduling.js";
+import type { JobSchedules, ScheduleRule } from "../scheduling.js";
 
 const MAX_RETAINED_RESULTS = 1_000;
 
@@ -7,11 +9,13 @@ type Completion = { outcome: JobOutcome } | { error: unknown };
 type Entry = {
   message: JobMessage;
   attempt: number;
-  retry?: NodeJS.Timeout;
+  availableAt: number;
+  scheduleId?: string;
   completion?: Completion;
   expiresAt?: number;
   waiters: Set<(completion: Completion) => void>;
 };
+type Schedule = { message: JobMessage; rule: ScheduleRule; pending: Entry };
 type Consumer = {
   execute: JobExecutor;
   concurrency: number;
@@ -23,16 +27,43 @@ type Consumer = {
   handle: JobWorker;
 };
 
-/** Process-local FIFO jobs; idempotency records last until close, ordinary results have bounded retention. */
+/** Process-local jobs and schedules; idempotency lasts until close, ordinary results have bounded retention. */
 export class MemoryBackend implements JobBackend {
   private readonly entries = new Map<string, Entry>();
   /** Active entries by dedupe key; cleared when the entry completes. */
   private readonly keyed = new Map<string, Entry>();
   private readonly queue: Entry[] = [];
+  private readonly recurring = new Map<string, Schedule>();
+  private wake?: NodeJS.Timeout;
   private readonly consumers = new Set<Consumer>();
   private readonly shutdown = new AbortController();
   private readonly resultTTLms: number;
   private closePromise?: Promise<void>;
+  public readonly schedules: JobSchedules = {
+    upsert: async (message, rule) => {
+      this.assertOpen();
+      message = prepareSubmission(message);
+      rule = validateRule(rule);
+      const id = scheduleId(message);
+      this.setSchedule(id, message, rule);
+      return id;
+    },
+    update: async (id, rule) => {
+      this.assertOpen();
+      rule = validateRule(rule);
+      const schedule = this.recurring.get(id);
+      if (!schedule) throw new Error(`Schedule not found: ${id}`);
+      this.setSchedule(id, schedule.message, rule);
+    },
+    remove: async (id) => {
+      this.assertOpen();
+      const schedule = this.recurring.get(id);
+      if (!schedule) return;
+      this.recurring.delete(id);
+      this.discard(schedule.pending);
+      this.pump();
+    },
+  };
 
   constructor(options: { resultTTLms?: number } = {}) {
     this.resultTTLms = options.resultTTLms ?? 60_000;
@@ -42,23 +73,50 @@ export class MemoryBackend implements JobBackend {
   public async submit(message: JobMessage): Promise<string> {
     this.assertOpen();
     message = prepareSubmission(message);
+    const entry = this.enqueue(message);
+    this.pump();
+    return entry.message.id;
+  }
+
+  private enqueue(message: JobMessage, schedule?: string): Entry {
     this.prune();
     const existing = this.entries.get(message.id);
     if (existing) {
       assertSameSubmission(existing.message, message);
-      return message.id;
+      return existing;
     }
     const key = message.policy.key;
     if (key !== undefined) {
       const active = this.keyed.get(key);
-      if (active) return active.message.id;
+      if (active) return active;
     }
-    const entry: Entry = { message: Object.freeze({ ...message }), attempt: 0, waiters: new Set() };
+    const entry: Entry = { message: Object.freeze({ ...message }), attempt: 0, waiters: new Set(),
+      availableAt: message.availableAt ?? Date.now(), ...(schedule ? { scheduleId: schedule } : {}),
+    };
     this.entries.set(message.id, entry);
     if (key !== undefined) this.keyed.set(key, entry);
     this.queue.push(entry);
+    return entry;
+  }
+
+  private setSchedule(id: string, message: JobMessage, rule: ScheduleRule): void {
+    const previous = this.recurring.get(id);
+    const unchanged = previous && JSON.stringify(previous.rule) === JSON.stringify(rule);
+    if (unchanged && JSON.stringify(previous.message.policy) === JSON.stringify(message.policy)) return;
+    const at = unchanged
+      ? previous.pending.availableAt : nextRun(rule, Date.now());
+    if (previous) this.discard(previous.pending);
+    const pending = this.enqueue({ ...occurrence(message, `repeat:${id}:${at}`), availableAt: at }, id);
+    this.recurring.set(id, { message, rule, pending });
     this.pump();
-    return message.id;
+  }
+
+  private discard(entry: Entry): void {
+    const index = this.queue.indexOf(entry);
+    if (index === -1) return;
+    this.queue.splice(index, 1);
+    this.complete(entry, { error: new ResultUnavailableError(entry.message.id) });
+    this.entries.delete(entry.message.id);
   }
 
   public async result(id: string, options?: WaitOptions): Promise<JobOutcome> {
@@ -113,13 +171,14 @@ export class MemoryBackend implements JobBackend {
   public close(): Promise<void> {
     if (!this.closePromise) {
       this.shutdown.abort(new Error("Memory backend is closed"));
+      clearTimeout(this.wake);
       this.closePromise = Promise.resolve().then(async () => {
         try {
           const results = await Promise.allSettled([...this.consumers].map((worker) => worker.handle.close()));
           const failed = results.find((result) => result.status === "rejected");
           if (failed?.status === "rejected") throw failed.reason;
         } finally {
-          for (const entry of this.entries.values()) clearTimeout(entry.retry);
+          this.recurring.clear();
           this.entries.clear();
           this.keyed.clear();
           this.queue.length = 0;
@@ -134,13 +193,34 @@ export class MemoryBackend implements JobBackend {
   }
 
   private pump(): void {
+    clearTimeout(this.wake);
     if (this.shutdown.signal.aborted) return;
     for (const consumer of this.consumers) {
       while (!consumer.stopping && consumer.active < consumer.concurrency && this.queue.length) {
-        const entry = this.queue.shift()!;
+        const index = this.queue.findIndex((entry) => entry.availableAt <= Date.now());
+        if (index === -1) break;
+        const [entry] = this.queue.splice(index, 1);
+        const schedule = entry.scheduleId && this.recurring.get(entry.scheduleId);
+        // Advance once on first delivery, never on retry. Keep only one future occurrence queued.
+        if (schedule && schedule.pending === entry) {
+          const now = Date.now();
+          const at = "every" in schedule.rule
+            ? entry.availableAt + (Math.floor((now - entry.availableAt) / schedule.rule.every) + 1) * schedule.rule.every
+            : nextRun(schedule.rule, now);
+          schedule.pending = this.enqueue({ ...occurrence(schedule.message, `repeat:${entry.scheduleId}:${at}`), availableAt: at }, entry.scheduleId);
+        }
         consumer.active++;
         void this.execute(consumer, entry);
       }
+    }
+    const now = Date.now();
+    let next = Infinity;
+    for (const entry of this.queue) {
+      if (entry.availableAt > now) next = Math.min(next, entry.availableAt);
+    }
+    if (Number.isFinite(next)) {
+      // Node clamps longer timers to 1 ms; wake in bounded segments instead.
+      this.wake = setTimeout(() => this.pump(), Math.min(next - now, 2_147_483_647));
     }
   }
 
@@ -167,12 +247,8 @@ export class MemoryBackend implements JobBackend {
   }
 
   private scheduleRetry(entry: Entry): void {
-    entry.retry = setTimeout(() => {
-      entry.retry = undefined;
-      if (this.shutdown.signal.aborted) return;
-      this.queue.push(entry);
-      this.pump();
-    }, backoffDelay(entry.message.policy, entry.attempt));
+    entry.availableAt = Date.now() + backoffDelay(entry.message.policy, entry.attempt);
+    this.queue.push(entry);
   }
 
   private finishConsumer(consumer: Consumer): void {

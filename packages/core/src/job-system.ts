@@ -4,6 +4,8 @@ import { JobExecutionError, NonRetryableError, prepareSubmission } from "./backe
 import type { JobBackend, JobFailure, JobMessage, JobOutcome, JobPolicy, JobWorker, WaitOptions } from "./backend.js";
 import { JsonCodec } from "./codec.js";
 import type { JobCodec } from "./codec.js";
+import { delivery } from "./scheduling.js";
+import type { Delay, Delivery, Recurrence, ScheduleHandle, Timing } from "./scheduling.js";
 
 type MaybePromise<T> = T | PromiseLike<T>;
 type Instances<Deps extends readonly Constructor[]> = {
@@ -62,7 +64,9 @@ export type JobSubmission<Output> = Promise<JobHandle<Output>> & {
 
 /** A definition is called to submit work; it must be attached to a system first. */
 export type Job<Deps extends readonly Constructor[], Input, Output> = {
-  (input: Input): JobSubmission<Awaited<Output>>;
+  (input: Input, timing?: Delay): JobSubmission<Awaited<Output>>;
+  (input: Input, timing: Recurrence): Promise<ScheduleHandle>;
+  (input: Input, timing: Timing): JobSubmission<Awaited<Output>> | Promise<ScheduleHandle>;
   readonly definition: JobDefinition<Deps, Input, Output>;
 };
 
@@ -122,7 +126,7 @@ function resolveMetadata(metadata: JobMetadata<any> = {}): ResolvedMetadata {
 }
 
 // Attachment is the only link from a definition to its backend; closing a system releases it.
-type Attachment = { owner: JobSystem; submit(input: unknown): JobSubmission<unknown> };
+type Attachment = { owner: JobSystem; submit(input: unknown, timing?: Timing): JobSubmission<unknown> | Promise<ScheduleHandle> };
 const attachments = new WeakMap<AnyJob, Attachment>();
 
 function submission<Output>(pending: Promise<JobHandle<Output>>): JobSubmission<Output> {
@@ -137,12 +141,12 @@ export function defineJob<const Deps extends readonly Constructor[], Input, Outp
 ): Job<Deps, Input, Output> {
   resolveMetadata(definition.metadata);
   const frozen = Object.freeze({ ...definition, deps: Object.freeze([...definition.deps]) as unknown as Deps });
-  const job = ((input: Input) => {
+  const job = ((input: Input, timing?: Timing) => {
     const attachment = attachments.get(job);
     if (!attachment) {
       return submission(Promise.reject(new Error("Job is not attached to a job system; pass it to createJobSystem first")));
     }
-    return attachment.submit(input);
+    return attachment.submit(input, timing);
   }) as Job<Deps, Input, Output>;
   Object.defineProperty(job, "definition", { value: frozen, enumerable: true });
   return Object.freeze(job);
@@ -215,7 +219,7 @@ export class JobSystem {
     }
     // Validate the whole catalog before attaching any of it, so a rejected system attaches nothing.
     for (const [name, { job }] of this.catalog) {
-      attachments.set(job, { owner: this, submit: (input) => this.submit(name, input) });
+      attachments.set(job, { owner: this, submit: (input, timing) => this.submit(name, input, timing) });
     }
     if (options.worker !== false) {
       this.worker = this.openWorker();
@@ -224,8 +228,11 @@ export class JobSystem {
     }
   }
 
-  private submit(name: string, input: unknown): JobSubmission<unknown> {
-    const pending = (async (): Promise<JobHandle<unknown>> => {
+  private submit(name: string, input: unknown, timing?: Timing): JobSubmission<unknown> | Promise<ScheduleHandle> {
+    let when: Delivery | undefined;
+    try { when = timing === undefined ? undefined : delivery(timing); }
+    catch (error) { return submission(Promise.reject(error)); }
+    const pending = (async (): Promise<JobHandle<unknown> | ScheduleHandle> => {
       this.assertOpen();
       const { metadata } = this.catalog.get(name)!;
       const key = metadata.key?.(input);
@@ -238,13 +245,39 @@ export class JobSystem {
         ...(key !== undefined ? { key: JSON.stringify([name, key]) } : {}),
         ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
       };
-      const message: JobMessage = prepareSubmission({ id: crypto.randomUUID(), name, input: this.codec.encode(input), policy });
+      const message: JobMessage = prepareSubmission({ id: crypto.randomUUID(), name, input: this.codec.encode(input), policy,
+        ...(when && "at" in when ? { availableAt: when.at } : {}),
+      });
       await this.worker;
       this.assertOpen();
+      if (when && "repeat" in when) {
+        if (!this.backend.schedules) throw new Error("This backend does not support recurring schedules");
+        const id = await this.backend.schedules.upsert(message, when.repeat);
+        return this.schedule(id);
+      }
       const id = await this.backend.submit(message);
       return Object.freeze({ id, result: (options?: WaitOptions) => this.result(id, options) });
     })();
-    return submission(pending);
+    // The normalized timing selects the return type; callers never receive a schedule's result() method.
+    return when && "repeat" in when ? pending as Promise<ScheduleHandle> : submission(pending as Promise<JobHandle<unknown>>);
+  }
+
+  /** Reopen a stored schedule by ID, including from a new process. */
+  public schedule(id: string): ScheduleHandle {
+    this.assertOpen();
+    if (typeof id !== "string" || !id) throw new Error("A schedule ID is required");
+    const schedules = this.backend.schedules;
+    if (!schedules) throw new Error("This backend does not support recurring schedules");
+    return Object.freeze({
+      id,
+      update: async (timing: Recurrence) => {
+        this.assertOpen();
+        const when = delivery(timing);
+        if (!("repeat" in when)) throw new Error("A schedule requires recurring timing");
+        await schedules.update(id, when.repeat);
+      },
+      remove: async () => { this.assertOpen(); await schedules.remove(id); },
+    });
   }
 
   public close(): Promise<void> {
