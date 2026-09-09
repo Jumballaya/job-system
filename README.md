@@ -76,7 +76,7 @@ export const sendEmail = defineJob({
 | --- | --- | --- |
 | `retries.attempts` | 3 | Total deliveries including the first. |
 | `retries.backoff` | exponential from 1 s | Wait after a failed attempt: 1 s, then 2 s. `"fixed"` or `"exponential"` uses the default delay. |
-| `timeout` | 5 minutes | The handler's signal aborts and the attempt fails; `Infinity` disables. |
+| `timeout` | 5 minutes | Requests cancellation from delivery onward; active work must settle before failure/retry. `Infinity` disables. |
 | `concurrency` | unlimited | Simultaneous executions of this job in one process, within the system's own limit. A waiting execution holds its worker slot. |
 | `key` | none | Derives a dedupe key from the input. Calling the job while a job with that key is queued or running returns the active job's handle instead of a new one. |
 
@@ -263,10 +263,19 @@ The handler's final AbortSignal belongs to the worker/backend, not the waiting
 caller. Providers may use it for observed execution loss; it cannot undo effects
 or forcibly interrupt JavaScript.
 
+The job deadline starts at delivery, including time waiting for a per-job
+concurrency permit. An expired waiter releases its worker slot without entering
+the handler. Active hooks and handlers must cooperate with cancellation, for
+example by passing the signal to `fetch`. Retries wait for the previous handler
+and its cleanup to settle; a handler ignoring its signal can continue producing
+effects after the deadline. Graceful shutdown drains that work rather than
+aborting it. A success hook completing after the deadline produces a terminal
+failure, without repeating the handler's effects.
+
 ## Execution outcomes and hooks
 
 Each execution gets a fresh DI scope and a context containing the stable submitted
-`jobId`, `name`, the `signal` that aborts on worker shutdown or timeout, and the
+`jobId`, `name`, the `signal` that aborts on execution loss or timeout, and the
 1-based `attempt` with `maxAttempts`. Hooks can be synchronous or asynchronous and
 are awaited:
 
@@ -277,7 +286,7 @@ are awaited:
 
 Dependency, beforeRun, handler, timeout and execution-cancellation failures call
 `onError(error, context)` on every attempt; when the context signal has aborted,
-the reported error is its reason (a `TimeoutError` or the shutdown reason), not
+the reported error is its reason (a `TimeoutError` or the execution-loss reason), not
 whatever the handler threw in response. Once attempts are exhausted or the
 error is `NonRetryableError`, become terminal failed outcomes. If onError also
 fails, both error messages are retained as an AggregateError description. Decode
