@@ -206,27 +206,29 @@ test("a handler ignoring timeout retains its dedupe reservation until it settles
   assert.equal(successes, 1);
 });
 
-test("an expired job waiting for a concurrency permit releases its worker slot without entering the handler", testOptions, async (t) => {
+test("an execution ignoring cancellation holds its own capacity while queued work keeps a fresh deadline and other jobs run", testOptions, async (t) => {
   const env = fixture(t);
   const entered = env.gate();
   const finish = env.gate();
   const seen = [];
   const limited = defineJob({
     deps: [],
-    async handler(input) { seen.push(input); if (input === "blocked") { entered.resolve(); await finish.promise; } return input; },
+    async handler(input, signal) { seen.push(input); if (input === "blocked") { entered.resolve(signal); await finish.promise; } return input; },
     metadata: { timeout: deadline, retries: once, concurrency: 1 },
   });
   const probe = defineJob({ deps: [], handler: () => "worker slot available" });
   env.system({ limited, probe }, { concurrency: 2 });
   const first = limited("blocked").result().then((value) => ({ value }), (error) => ({ error }));
-  await entered.promise;
-  await assert.rejects(limited("expired").result({ signal: AbortSignal.timeout(2_000) }), timedOut);
+  const signal = await entered.promise;
+  const queued = await limited("queued");
+  if (!signal.aborted) await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
   assert.equal(await probe(null).result({ signal: AbortSignal.timeout(2_000) }), "worker slot available");
   assert.deepEqual(seen, ["blocked"]);
   finish.resolve();
   assert.ok(timedOut((await first).error));
+  assert.equal(await queued.result(), "queued");
   assert.equal(await limited("healthy").result(), "healthy");
-  assert.deepEqual(seen, ["blocked", "healthy"]);
+  assert.deepEqual(seen, ["blocked", "queued", "healthy"]);
 });
 
 test("timeout during beforeRun cancels pending work and prevents handler effects", testOptions, async (t) => {
@@ -355,19 +357,17 @@ test("backend execution cancellation aborts a live request even when the job has
   assert.equal(cleaned, 1);
 });
 
-test("cancellation during permit handoff cannot strand the next job or admit the canceled handler", testOptions, async (t) => {
+test("execution revoked before dispatch cannot enter its handler or strand the next job", testOptions, async (t) => {
   const env = fixture(t);
   const release = env.gate();
-  const delivered = env.gate();
   const controllers = new Map();
   const seen = [];
   const reason = new Error("execution revoked during handoff");
   class Backend extends MemoryBackend {
     async work(execute, options) {
       return super.work((message, _signal, attempt) => {
-        const controller = new AbortController();
+        const controller = controllers.get(message.id) ?? new AbortController();
         controllers.set(message.id, controller);
-        if (controllers.size === 3) delivered.resolve();
         return execute(message, controller.signal, attempt);
       }, options);
     }
@@ -385,9 +385,9 @@ test("cancellation during permit handoff cannot strand the next job or admit the
   const first = await job("first");
   const canceled = await job("canceled");
   canceledId = canceled.id;
+  controllers.set(canceledId, new AbortController());
   const next = await job("next");
   const rejected = env.observe(assert.rejects(canceled.result(), (error) => error instanceof JobExecutionError && error.message === reason.message));
-  await delivered.promise;
   release.resolve();
   assert.equal(await first.result(), "first");
   await rejected;

@@ -131,6 +131,9 @@ test("3 — saturated work cannot starve another job type or evade its own concu
     const fast = await producer.call("fast", { label: `fast-${index}` });
     assert.deepEqual(await producer.result(fast.id, 1_000), { label: `fast-${index}`, value: 42 });
   }
+  await pause(350); // Force several capacity deferrals before allowing the limited backlog to drain.
+  assert.equal((await producer.call("slow", { label: "slow-1", gate: "slow-1" })).id, slow[1].id,
+    "waiting for capacity released the active deduplication reservation");
   assert.equal(worker.events.filter((event) => event.event === "started" && event.name === "slow").length, 1,
     "isolation must not bypass the configured slow-job concurrency");
   for (let index = 0; index < slow.length; index++) {
@@ -140,6 +143,16 @@ test("3 — saturated work cannot starve another job type or evade its own concu
     await producer.result(started.id);
   }
   assert.equal(new Set(worker.events.filter((event) => event.event === "effect" && event.name === "slow").map((event) => event.id)).size, slow.length);
+  const started = worker.events.filter((event) => event.event === "started");
+  assert.equal(started.length, slow.length + 3, "capacity waiting duplicated work or spent retries");
+  assert.ok(started.every((event) => event.attempt === 1), "capacity waiting spent an execution attempt");
+  assert.equal(worker.events.filter((event) => event.event === "attemptFailed").length, 0);
+  let active = 0;
+  for (const event of worker.events) {
+    if (event.event === "started") active++;
+    if (event.event === "effect") active--;
+    assert.ok(active >= 0 && active <= 2, "dispatch exceeded the physical worker's total capacity");
+  }
 });
 
 test("4 — shutdown is bounded, signals cleanup, and recovers unfinished work without premature overlap or spent attempts", { timeout: 100_000 }, async (t) => {

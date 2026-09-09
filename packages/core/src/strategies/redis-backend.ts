@@ -1,13 +1,16 @@
-import { Queue, Worker } from "bullmq";
+import { DelayedError, Queue, Worker } from "bullmq";
 import type { Job, RedisOptions } from "bullmq";
 import { assertSameSubmission, prepareSubmission, ResultUnavailableError } from "../backend.js";
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 import { occurrence, scheduleId, validateRule } from "../scheduling.js";
 import type { JobSchedules, ScheduleRule } from "../scheduling.js";
+import { ConcurrencyLimits } from "../concurrency.js";
 
 const redisRequestTimeoutMs = 5_000;
 const resultPollIntervalMs = 50;
 const cleanupBatchSize = 100;
+// Return saturated deliveries to Redis so other job types can use the worker immediately.
+const capacityDelayMs = 100;
 type StoredMessage = JobMessage & { readonly resultTTLSeconds?: number; readonly schedule?: ScheduleRule };
 
 export interface RedisBackendOptions {
@@ -218,18 +221,26 @@ export class RedisBackend implements JobBackend {
     if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
       throw new Error("Worker concurrency must be a positive safe integer");
     }
+    const limits = new ConcurrencyLimits(options?.concurrencyByJob);
     const execution = new AbortController();
-    const worker = new Worker<JobMessage, JobOutcome>(this.queue.name, async (job) => {
-      // BullMQ counts previous failures in attemptsMade; a thrown retryable failure lets it apply the backoff.
-      const attempt = job.attemptsMade + 1;
-      const message = job.id && recurringId.test(job.id) ? occurrence(job.data, job.id) : job.data;
-      // Recurrence can run forever without another producer submission to trigger retention cleanup.
-      if (message !== job.data) await this.prune();
-      const outcome = await execute(message, execution.signal, attempt);
-      if (outcome.status === "failed" && outcome.retryable && attempt < (job.opts.attempts ?? 1)) {
-        throw new Error(outcome.error.message);
+    const worker = new Worker<JobMessage, JobOutcome>(this.queue.name, async (job, token) => {
+      const release = limits.acquire(job.data.name);
+      if (!release) {
+        // moveToDelayed preserves attemptsMade and active deduplication; DelayedError avoids a failure outcome.
+        await job.moveToDelayed(Date.now() + capacityDelayMs, token);
+        throw new DelayedError();
       }
-      return outcome;
+      try {
+        const attempt = job.attemptsMade + 1;
+        const message = job.id && recurringId.test(job.id) ? occurrence(job.data, job.id) : job.data;
+        // Recurrence can run forever without another producer submission to trigger retention cleanup.
+        if (message !== job.data) await this.prune();
+        const outcome = await execute(message, execution.signal, attempt);
+        if (outcome.status === "failed" && outcome.retryable && attempt < (job.opts.attempts ?? 1)) {
+          throw new Error(outcome.error.message);
+        }
+        return outcome;
+      } finally { release(); }
     }, {
       connection: { ...this.connection, maxRetriesPerRequest: null },
       concurrency,

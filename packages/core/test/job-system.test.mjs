@@ -408,22 +408,35 @@ test("a timeout aborts the handler's signal, fails the attempt, and allows a ret
   assert.equal(await slow({ ms: 1 }).result(), "finished");
 });
 
-test("per-job concurrency bounds simultaneous executions within the system's limit", { timeout: 5_000 }, async (t) => {
+test("per-job concurrency covers handlers and success hooks while other jobs use the remaining worker capacity", { timeout: 5_000 }, async (t) => {
   let active = 0;
   let peak = 0;
+  const release = Promise.withResolvers();
+  const hooksEntered = Promise.withResolvers();
+  let hooks = 0;
   const limited = defineJob({
     deps: [], metadata: { concurrency: 2 },
     async handler(input) {
       active++;
       peak = Math.max(peak, active);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      active--;
       return input;
     },
+    async onSuccess() {
+      if (++hooks === 2) hooksEntered.resolve();
+      await release.promise;
+      active--;
+    },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { limited }, concurrency: 4 });
-  t.after(() => jobs.close());
-  assert.deepEqual(await Promise.all([1, 2, 3, 4, 5].map((n) => limited(n).result())), [1, 2, 3, 4, 5]);
+  const probe = defineJob({ deps: [], handler: () => "available" });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { limited, probe }, concurrency: 4 });
+  t.after(async () => { release.resolve(); await jobs.close(); });
+  const results = Promise.all([1, 2, 3, 4, 5].map((n) => limited(n).result()));
+  await hooksEntered.promise;
+  assert.equal(await probe(null).result(), "available");
+  assert.equal(active, 2);
+  assert.equal(hooks, 2);
+  release.resolve();
+  assert.deepEqual(await results, [1, 2, 3, 4, 5]);
   assert.equal(peak, 2);
 });
 

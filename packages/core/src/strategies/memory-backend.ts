@@ -2,6 +2,7 @@ import { assertSameSubmission, backoffDelay, prepareSubmission, ResultUnavailabl
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 import { nextRun, occurrence, scheduleId, validateRule } from "../scheduling.js";
 import type { JobSchedules, ScheduleRule } from "../scheduling.js";
+import { ConcurrencyLimits } from "../concurrency.js";
 
 const MAX_RETAINED_RESULTS = 1_000;
 
@@ -19,6 +20,7 @@ type Schedule = { message: JobMessage; rule: ScheduleRule; pending: Entry };
 type Consumer = {
   execute: JobExecutor;
   concurrency: number;
+  limits: ConcurrencyLimits;
   active: number;
   stopping: boolean;
   failure?: { error: unknown };
@@ -147,13 +149,14 @@ export class MemoryBackend implements JobBackend {
     this.assertOpen();
     const concurrency = options?.concurrency ?? 1;
     if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error("concurrency must be a positive integer");
+    const limits = new ConcurrencyLimits(options?.concurrencyByJob);
     let resolveDone!: () => void;
     let rejectDone!: (error: unknown) => void;
     const done = new Promise<void>((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
     // Keep failures observable through done without creating an unhandled rejection before callers attach.
     void done.catch(() => {});
     const consumer: Consumer = {
-      execute, concurrency, active: 0, stopping: false, resolveDone, rejectDone,
+      execute, concurrency, limits, active: 0, stopping: false, resolveDone, rejectDone,
       handle: {
         done,
         close: () => {
@@ -197,7 +200,12 @@ export class MemoryBackend implements JobBackend {
     if (this.shutdown.signal.aborted) return;
     for (const consumer of this.consumers) {
       while (!consumer.stopping && consumer.active < consumer.concurrency && this.queue.length) {
-        const index = this.queue.findIndex((entry) => entry.availableAt <= Date.now());
+        let release: (() => void) | undefined;
+        const index = this.queue.findIndex((entry) => {
+          if (entry.availableAt > Date.now()) return false;
+          release = consumer.limits.acquire(entry.message.name);
+          return release !== undefined;
+        });
         if (index === -1) break;
         const [entry] = this.queue.splice(index, 1);
         const schedule = entry.scheduleId && this.recurring.get(entry.scheduleId);
@@ -210,7 +218,7 @@ export class MemoryBackend implements JobBackend {
           schedule.pending = this.enqueue({ ...occurrence(schedule.message, `repeat:${entry.scheduleId}:${at}`), availableAt: at }, entry.scheduleId);
         }
         consumer.active++;
-        void this.execute(consumer, entry);
+        void this.execute(consumer, entry, release!);
       }
     }
     const now = Date.now();
@@ -224,7 +232,7 @@ export class MemoryBackend implements JobBackend {
     }
   }
 
-  private async execute(consumer: Consumer, entry: Entry): Promise<void> {
+  private async execute(consumer: Consumer, entry: Entry, release: () => void): Promise<void> {
     entry.attempt++;
     try {
       const outcome = await consumer.execute(entry.message, new AbortController().signal, entry.attempt);
@@ -238,6 +246,7 @@ export class MemoryBackend implements JobBackend {
       consumer.stopping = true;
       consumer.failure ??= { error };
     } finally {
+      release();
       consumer.active--;
       if (consumer.stopping && consumer.active === 0) {
         this.finishConsumer(consumer);

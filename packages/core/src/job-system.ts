@@ -17,7 +17,7 @@ export interface JobContext {
   readonly name: string;
   /** Aborted by timeout or backend-reported execution loss; graceful shutdown drains active work. */
   readonly signal: AbortSignal;
-  /** Starts at 1 and counts every delivery, including retries. */
+  /** Starts at 1 and counts execution attempts, including retries; capacity waiting doesn't count. */
   readonly attempt: number;
   readonly maxAttempts: number;
 }
@@ -29,7 +29,7 @@ export type JobMetadata<Input = unknown> = {
   readonly retries?: { readonly attempts?: number; readonly backoff?: Backoff };
   /** Milliseconds from delivery until cancellation is requested; active work must settle before retry. */
   readonly timeout?: number;
-  /** Simultaneous executions of this job within one process; the system's concurrency still applies. */
+  /** Simultaneous executions, including hooks, within this worker; the system's concurrency still applies. */
   readonly concurrency?: number;
 } & ({
   /** Derives a key scoped to this job's registration; submitting while active reuses that job. */
@@ -152,37 +152,7 @@ export function defineJob<const Deps extends readonly Constructor[], Input, Outp
   return Object.freeze(job);
 }
 
-/** Bounds simultaneous executions; waiting holds the worker slot, so limits trade throughput for safety. */
-class Gate {
-  private active = 0;
-  private readonly waiters = new Set<() => void>();
-
-  constructor(private readonly limit: number) {}
-
-  public async enter(signal: AbortSignal): Promise<void> {
-    signal.throwIfAborted();
-    if (this.active < this.limit) {
-      this.active++;
-      return;
-    }
-    await new Promise<void>((resolve, reject) => {
-      const cleanup = () => { this.waiters.delete(ready); signal.removeEventListener("abort", abort); };
-      const ready = () => { cleanup(); resolve(); };
-      const abort = () => { cleanup(); reject(signal.reason); };
-      this.waiters.add(ready);
-      signal.addEventListener("abort", abort, { once: true });
-    });
-  }
-
-  public leave(): void {
-    // Transfer the occupied permit directly; its recipient releases it even if cancellation wins next.
-    const next = this.waiters.values().next().value;
-    if (next) next();
-    else this.active--;
-  }
-}
-
-type Entry = { job: AnyJob; metadata: ResolvedMetadata; gate?: Gate };
+type Entry = { job: AnyJob; metadata: ResolvedMetadata };
 
 /** Runs its catalog through one backend worker; definitions submit through it once attached. */
 export class JobSystem {
@@ -214,8 +184,7 @@ export class JobSystem {
       const owner = attachments.get(job)?.owner;
       if (owner && !owner.closing) throw new Error(`Job "${name}" is already attached to another job system`);
       const metadata = resolveMetadata(job.definition.metadata);
-      const gate = metadata.concurrency === Infinity ? undefined : new Gate(metadata.concurrency);
-      this.catalog.set(name, { job, metadata, gate });
+      this.catalog.set(name, { job, metadata });
     }
     // Validate the whole catalog before attaching any of it, so a rejected system attaches nothing.
     for (const [name, { job }] of this.catalog) {
@@ -312,9 +281,12 @@ export class JobSystem {
   }
 
   private async openWorker(): Promise<JobWorker> {
+    const concurrencyByJob = Object.fromEntries([...this.catalog]
+      .filter(([, entry]) => Number.isFinite(entry.metadata.concurrency))
+      .map(([name, entry]) => [name, entry.metadata.concurrency]));
     const worker = await this.backend.work(
       (message, signal, attempt) => this.execute(message, signal, attempt),
-      { concurrency: this.concurrency },
+      { concurrency: this.concurrency, concurrencyByJob },
     );
     // Observe terminal worker failure once, so pending and future submissions cannot wait on a dead worker.
     void worker.done.then(
@@ -327,7 +299,7 @@ export class JobSystem {
   private async execute(message: JobMessage, workerSignal: AbortSignal, attempt: number): Promise<JobOutcome> {
     const entry = this.catalog.get(message.name);
     if (!entry) return { status: "failed", error: failure(new Error(`Unknown job: ${message.name}`)), retryable: false };
-    const { metadata, gate } = entry;
+    const { metadata } = entry;
     const job = entry.job.definition;
     const signal = Number.isFinite(metadata.timeout)
       ? AbortSignal.any([workerSignal, AbortSignal.timeout(metadata.timeout)])
@@ -342,10 +314,7 @@ export class JobSystem {
       return { status: "failed", error: failure(error), retryable: false };
     }
     let output: unknown;
-    let entered = false;
     try {
-      await gate?.enter(signal);
-      entered = true;
       signal.throwIfAborted();
       const scope = this.container.createScope();
       const dependencies = job.deps.map((dependency) => scope.resolve(dependency));
@@ -363,8 +332,6 @@ export class JobSystem {
           `${failure(error).message}; onError also failed: ${failure(hookError).message}`)) };
       }
       return { status: "failed", error: failure(error), retryable };
-    } finally {
-      if (entered) gate?.leave();
     }
     try {
       // Post-success hook/encoding failures are terminal, never a reason to repeat handler effects.

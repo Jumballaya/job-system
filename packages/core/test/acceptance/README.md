@@ -1,7 +1,7 @@
 # V1 replacement acceptance contracts
 
-Exactly six top-level tests, numbered to match the agreed gaps. Tests 1 and 2 pass;
-3–6 remain intentionally red until implemented. They are separate from the existing regression
+Exactly six top-level tests, numbered to match the agreed gaps. Tests 1–3 pass;
+4–6 remain intentionally red until implemented. They are separate from the existing regression
 suite; no tests use `skip`, `todo`, unconditional failure, or feature-detection fallbacks.
 Passing establishes these scenarios, not proof against every possible failure.
 
@@ -22,7 +22,7 @@ at the public backend boundary. Process cleanup runs even when an assertion fail
 |---|---|
 | 1 | Delayed and absolute deliveries are not early; immediate work can pass them. Concurrent producers register one schedule with canonical input identity. Recurrence continues after producer exit and Redis/worker restart. A fresh process changes interval/daily/cron rules and removes it by ID; removal survives another restart and later updates reject. A controlled-clock process checks hourly intervals, daily DST adjustment, weekday cron, and removal. |
 | 2 | A blocked recurring occurrence allows a distinct successor. Ordinary same-key work still coalesces while running and during retry, without conflating different job definitions. Accepted occurrences drain after schedule removal. |
-| 3 | A backlog limited to one concurrent handler cannot prevent another job type from executing. The backlog later drains exactly once without exceeding its configured concurrency. |
+| 3 | A backlog limited to one concurrent handler cannot prevent another job type from executing. Capacity waits preserve deduplication and spend no execution attempts. The backlog later drains exactly once without exceeding its job limit or total worker capacity. |
 | 4 | Shutdown stops intake, signals cooperative cancellation, and reports its deadline rather than waiting forever. A replacement cannot execute work still owned by live handlers or unfinished cleanup. After the old process dies, unfinished work recovers without spending a business retry; the replacement shuts down without retained resources. |
 | 5 | A new process inspects work submitted by an exited producer through queued/running/succeeded/failed states, including inputs, timestamps, attempts, outputs, and errors. Failure history outlives ordinary result retention and Redis restart. Unknown/expired records return null. |
 | 6 | Startup failure and later idle-worker failure each notify the host once, without needing a failing submission. Future callers see the original error; connections close. Job errors and ordinary shutdown do not trigger the worker-error hook. |

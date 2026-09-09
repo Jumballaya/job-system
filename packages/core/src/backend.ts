@@ -39,6 +39,8 @@ export interface WaitOptions {
 
 export interface WorkerOptions {
   readonly concurrency?: number;
+  /** Per-registration limits within this worker. Saturated jobs wait without occupying execution slots. */
+  readonly concurrencyByJob?: Readonly<Record<string, number>>;
 }
 
 export interface JobWorker {
@@ -48,7 +50,7 @@ export interface JobWorker {
   close(): Promise<void>;
 }
 
-/** `attempt` starts at 1 and counts every delivery of the same message. */
+/** `attempt` starts at 1; waiting for worker capacity never spends an attempt. */
 export type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: number) => Promise<JobOutcome>;
 
 /** Own delivery and retained outcomes. Recover infrastructure failures without promising exactly-once effects. */

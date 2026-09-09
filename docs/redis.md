@@ -41,6 +41,14 @@ to BullMQ so it schedules the next delivery; the final outcome is retained like 
 successful output. Executor rejection is infrastructure failure and shares the same
 attempt budget. Delivery can repeat; handlers must account for repeated side effects.
 
+Workers enforce the catalog's per-job concurrency before starting an execution.
+If that job type is saturated, the worker returns the delivery to Redis with a
+100 ms capacity delay and immediately continues looking for other work. This keeps
+the ID and deduplication reservation, spends no execution attempt, and starts no
+handler timeout. Capacity remains reserved through hooks and asynchronous cleanup.
+Limits apply per worker; a fully occupied worker waits for an execution to settle.
+Large saturated backlogs require repeated Redis admission checks.
+
 Ordinary results remain available for the configured TTL after completion, including to
 new backend instances. Expired or unknown IDs reject with `ResultUnavailableError`.
 The adapter scans bounded batches of completed and failed jobs on later submissions and recurring deliveries,

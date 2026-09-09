@@ -77,7 +77,7 @@ export const sendEmail = defineJob({
 | `retries.attempts` | 3 | Total deliveries including the first. |
 | `retries.backoff` | exponential from 1 s | Wait after a failed attempt: 1 s, then 2 s. `"fixed"` or `"exponential"` uses the default delay. |
 | `timeout` | 5 minutes | Requests cancellation from delivery onward; active work must settle before failure/retry. `Infinity` disables. |
-| `concurrency` | unlimited | Simultaneous executions of this job in one process, within the system's own limit. A waiting execution holds its worker slot. |
+| `concurrency` | unlimited | Simultaneous executions of this job per worker, including hooks, within the system's own limit. Saturated work stays queued so other job types can use available slots. |
 | `key` | none | Derives a dedupe key from the input. Calling the job while a job with that key is queued or running returns the active job's handle instead of a new one. |
 | `idempotencyKey` | none | Identifies one operation permanently: identical submissions reuse its ID and outcome, including after completion. Mutually exclusive with `key`. |
 
@@ -379,9 +379,9 @@ The handler's final AbortSignal belongs to the worker/backend, not the waiting
 caller. Providers may use it for observed execution loss; it cannot undo effects
 or forcibly interrupt JavaScript.
 
-The job deadline starts at delivery, including time waiting for a per-job
-concurrency permit. An expired waiter releases its worker slot without entering
-the handler. Active hooks and handlers must cooperate with cancellation, for
+The job deadline starts when worker capacity is reserved for execution. Waiting
+for per-job capacity stays queued, consumes no retry, and starts no execution
+deadline. Active hooks and handlers must cooperate with cancellation, for
 example by passing the signal to `fetch`. Retries wait for the previous handler
 and its cleanup to settle; a handler ignoring its signal can continue producing
 effects after the deadline. Graceful shutdown drains that work rather than
@@ -439,8 +439,8 @@ type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: number) =
 ```
 
 Backend inputs/outputs are data-only envelopes;
-core keeps catalog typing, serialization, DI, hooks, timeouts and per-job
-concurrency. A backend owns acceptance, delivery, retries, recovery, retention,
+core keeps catalog typing, serialization, DI, hooks, and timeouts. A backend owns
+worker admission, acceptance, delivery, retries, recovery, retention,
 result waiting, acknowledgments and its connections. Each message carries its
 `policy`: total attempts, backoff, and an optional active dedupe key or durable
 idempotency key. Core derives a stable ID from the registration name and
@@ -454,6 +454,14 @@ retained. `JobWorker.done` exposes later terminal processing failure; `close`
 drains active callbacks. A callback rejection is an infrastructure failure, with
 recovery documented by the adapter. Unknown/expired IDs reject rather than waiting
 forever.
+
+`WorkerOptions.concurrencyByJob` carries the catalog's finite per-job limits,
+keyed by registration name. Backends reserve capacity before invoking the executor
+and release it after the whole callback settles, including hooks and cleanup.
+Saturated job types must leave execution slots available for other types, retaining
+their IDs and deduplication reservations without consuming execution attempts.
+Limits apply independently to each worker; a fully occupied worker waits for an
+execution to finish before starting another.
 
 `JobMessage.availableAt`, when present, is the earliest first delivery in Unix
 milliseconds; delay must not occupy an execution slot. Retry backoff remains
@@ -486,8 +494,8 @@ terminal failures, cancellation and shutdown. No tests or infrastructure setup
 are added to the tiny app's source directory.
 
 The six [V1 replacement acceptance contracts](packages/core/test/acceptance/README.md)
-run separately; #1 (timing and schedules) and #2 (successor delivery) pass.
-#3–#6 intentionally remain failing until implemented:
+run separately; #1 (timing and schedules), #2 (successor delivery), and #3 (workload
+isolation) pass. #4–#6 intentionally remain failing until implemented:
 
 ```sh
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance
