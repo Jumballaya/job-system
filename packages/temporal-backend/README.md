@@ -71,7 +71,19 @@ Worker instance. All consumers of this task queue must include the job workflow/
   workflow results without a worker. Open idempotency records require a worker to answer queries.
 - Schedules use Temporal Schedules with overlapping occurrences allowed. Each occurrence has
   separate execution identity. Interval schedules require whole seconds; cron and timezone
-  interpretation follows Temporal. Removing a schedule leaves accepted occurrences intact.
+  interpretation follows Temporal. The adapter removes `key`/`idempotencyKey` from scheduled
+  occurrence policies; their outcomes use normal namespace retention, not open operation ledgers.
+  Removing a schedule leaves accepted occurrences intact. Worker downtime may accumulate
+  queued occurrences; service-outage catch-up uses Temporal's default schedule policy.
+
+## Redeploys and schedule handles
+
+Schedules live in Temporal, independently of the process that created them. Persist
+`schedule.id` in application storage and reopen it with `jobs.schedule(savedScheduleId)`
+after initializing the same namespace, task queue, and job catalog. The handle's methods
+are recreated locally; job names, encoded inputs, and timing are stored remotely.
+Reopening does not submit work or change timing. Re-registering the original timing rule
+can overwrite a later edit. Preserve job registration names and payload compatibility.
 
 ## Cancellation and shutdown
 

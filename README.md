@@ -1,8 +1,8 @@
 # Job system
 
 A lightweight TypeScript library for class-based dependency injection and typed jobs
-with swappable backends. Requires Node.js 24 and pnpm 11.18.0. Core includes memory and Redis strategies;
-the Redis strategy uses BullMQ.
+with swappable backends. This workspace uses Node.js 24 and pnpm 11.18.0. Core includes memory and Redis strategies;
+the Redis strategy uses BullMQ. Temporal is available in the optional `temporal-backend` package.
 
 ```sh
 pnpm install
@@ -10,7 +10,9 @@ pnpm test
 pnpm start
 ```
 
-`pnpm build` compiles core and app. `pnpm start` runs the app demo against Redis
+`pnpm build` compiles core, app, and the Temporal adapter. `pnpm test` also runs Temporal
+integration tests, which start isolated servers and download their executables on first use.
+`pnpm start` runs the app demo against Redis
 on `127.0.0.1:6379` (`docker compose up -d` starts one); see "Assemble the system"
 for the scenarios it walks through and the environment switches.
 
@@ -47,15 +49,15 @@ Handler arguments are input, dependency instances in declaration order, then an
 or hook declared earlier may need its parameter annotated due to TypeScript's
 inference order.
 
-`defineJob` snapshots and freezes the definition and dependency list, and returns a
-callable job. It does not register services or start work. Calling the job submits
+`defineJob` shallowly copies and freezes the definition and a copied dependency list,
+and returns a callable job. Nested metadata is not deeply frozen; configure it before
+creating the system and do not mutate it afterward. It does not register services or start work. Calling the job submits
 work through whichever system it is attached to; a job belongs to one open system
 at a time and is released when that system closes.
 
 ## Job metadata
 
-Every job carries a policy. The defaults are meant for production and apply when
-`metadata` is omitted:
+Every job carries a policy. These defaults apply when `metadata` is omitted:
 
 ```ts
 export const sendEmail = defineJob({
@@ -74,14 +76,14 @@ export const sendEmail = defineJob({
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `retries.attempts` | 3 | Total deliveries including the first. |
+| `retries.attempts` | 3 | Execution-attempt budget, including the first; infrastructure redelivery accounting is provider-specific. |
 | `retries.backoff` | exponential from 1 s | Wait after a failed attempt: 1 s, then 2 s. `"fixed"` or `"exponential"` uses the default delay. |
-| `timeout` | 5 minutes | Requests cancellation from delivery onward; active work must settle before failure/retry. `Infinity` disables. |
+| `timeout` | 5 minutes | Requests cancellation from execution start; active work must settle before a business retry. `Infinity` disables the core timeout. |
 | `concurrency` | unlimited | Simultaneous executions of this job per worker, including hooks, within the system's own limit. Saturated work stays queued so other job types can use available slots. |
 | `key` | none | Derives a dedupe key from the input. Calling the job while a job with that key is queued or running returns the active job's handle instead of a new one. |
-| `idempotencyKey` | none | Identifies one operation permanently: identical submissions reuse its ID and outcome, including after completion. Mutually exclusive with `key`. |
+| `idempotencyKey` | none | Identifies one retained operation: identical submissions reuse its ID and outcome, including after completion. Provider retention is described below. Mutually exclusive with `key`. |
 
-Any thrown error is retried until attempts run out, except `NonRetryableError`,
+Dependency construction, `beforeRun`, and handler errors retry until attempts run out, except `NonRetryableError`,
 exported from `core`, which fails immediately. Failures after the handler
 succeeded, such as an `onSuccess` hook error, never retry. Handlers with external
 effects should use a persisted operation ID, because a retry repeats the whole handler.
@@ -90,7 +92,9 @@ Invalid metadata is rejected by `defineJob`.
 For durable operations, declare `metadata.idempotencyKey: input => input.operationId`
 and call the job normally. Include tenant identity in the key when applicable.
 Redis retains these operations and their outcomes without expiry; memory retains
-them only until the backend closes. A different input for the same operation rejects
+them only until the backend closes. Temporal keeps ordinary keyed operations in open
+workflows that periodically compact their history; scheduled occurrences use normal
+namespace retention instead. A different input for the same operation rejects
 with `IdempotencyConflictError`. See [durable idempotency](docs/idempotency.md) for
 downstream keys, database transactions, and the crash-recovery guarantees.
 
@@ -239,6 +243,7 @@ configured dependency container. Worker startup and terminal worker failures rej
 calls and pending results; create a new system after worker failure. A container is
 optional for jobs without dependencies and for submit-only systems. Background startup
 failures are retained and reject subsequent calls and `close()`.
+Temporal borrows its client and native connection; the application owns their cleanup.
 
 Provide an optional system `onError` to hear about startup or terminal worker failure
 even while idle:
@@ -318,9 +323,10 @@ with `ShutdownTimeoutError` and requests cancellation through execution signals.
 Repeated calls return the same close promise. Timing bounds require a responsive
 JavaScript event loop.
 
-Cleanup continues after the deadline. Live handlers retain their worker capacity
-and execution leases; connections close once those handlers and their cleanup
-settle. Interrupted handlers return to the queue with their original IDs and
+Cleanup continues after the deadline. Live handlers retain worker capacity, and
+Redis workers continue lease renewal while their event loop and connection remain responsive.
+Owned connections close once handlers and cleanup settle; Temporal's borrowed connections
+remain open. Execution loss can still cause provider redelivery. Interrupted handlers return to the queue with their original IDs and
 remaining attempts, without invoking the business-error hook. A success hook that
 outlives the deadline produces a terminal failure instead of repeating its handler.
 Closing during startup still closes the worker if it arrives after the deadline.
@@ -338,6 +344,8 @@ evict failure history. Retention is enforced on reads even when physical cleanup
 is deferred. Unknown or expired results reject with
 `ResultUnavailableError`. Idempotent operations are exempt from both age and count
 cleanup; their retained records grow with the number of distinct operation keys.
+Temporal's ordinary results follow namespace history retention; its open idempotency
+records are retained separately. See the [Temporal guide](packages/temporal-backend/README.md).
 
 ## Inspect executions
 
@@ -351,6 +359,8 @@ if (record?.status === "succeeded") console.log(record.output);
 completion. Redis supports lookup from a different process with the same queue
 and codec, including a producer using `worker: false`. No additional database is
 needed. Unknown or expired IDs return `null`; connection and decoding errors reject.
+Temporal inspection usually requires a compatible worker to answer workflow queries;
+never-started queued records can be read without one.
 
 Records contain `id`, `name`, decoded `input`, `status`, `attempts`, and `createdAt`.
 Status is `queued`, `running`, `succeeded`, or `failed`. `startedAt` describes the
@@ -379,7 +389,7 @@ const schedule = await updateMemory(input, { every: "1h" });
 await schedule.update({ daily: "09:00", timezone: "America/New_York" });
 await schedule.remove();
 
-// Reopen from another process using the same Redis queue.
+// Reopen from another process using the same backend location.
 await jobs.schedule(savedScheduleId).remove();
 ```
 
@@ -390,13 +400,31 @@ its timing updates that registration. Store the returned ID to manage it later.
 Different input creates another schedule. `JsonCodec` canonicalizes object keys;
 custom codecs must encode equivalent inputs identically for stable schedule identity.
 
+The handle's methods are local closures; they are not serialized. Redis or Temporal
+stores the job registration name, encoded input, delivery policy, and schedule rule.
+Persist `schedule.id` in application storage if you need to manage that schedule later:
+
+```ts
+// After redeploy: initialize the same backend and job catalog, then reopen the handle.
+const schedule = jobs.schedule(savedScheduleId);
+await schedule.update({ every: "2h" });
+```
+
+Reopening a handle neither creates nor changes the stored schedule; existence is checked
+when its methods contact the backend. Redis/Temporal schedules keep existing without the
+producer process. New workers resolve the stored job name against the deployed catalog,
+decode the input, and construct dependencies locally. Preserve registration names and
+payload compatibility across deployments. Re-registering an old timing rule on startup
+can overwrite a later edit; reopen by ID to preserve it.
+
 Durations use `ms`, `s`, `m`, `h`, `d`, or `w`; intervals first run after one interval.
 `at` accepts a Date, Unix milliseconds, or an ISO timestamp with an explicit offset.
 These times specify earliest delivery; busy or offline workers can deliver later.
 `daily` uses 24-hour `HH:mm`. For more complex calendars, use
 `{ cron: "0 9 * * 1-5", timezone: "America/New_York" }`. Cron accepts five fields or
-six including seconds. Calendar rules require an explicit IANA timezone and follow
-cron-parser's DST rules. Elapsed intervals such as `"1d"` mean 24 hours.
+six including seconds. Calendar rules require an explicit IANA timezone. Memory and Redis
+use cron-parser's DST rules; Temporal uses its own scheduler semantics and requires
+whole-second intervals. Elapsed intervals such as `"1d"` mean 24 hours.
 
 Redis persists registrations and pending deliveries. Workers resume them on restart
 without producer code running again. After downtime, the pending occurrence runs
@@ -405,19 +433,24 @@ registration preserves the pending occurrence; changed timing replaces it.
 Removal is idempotent and stops future occurrences; already-started work and its
 retries finish normally. Updating a removed schedule rejects.
 
-Each occurrence gets a distinct execution ID that survives its retries. Active
-deduplication and durable idempotency apply within that occurrence, independently
-of other occurrences and ordinary calls. Use the execution ID from hooks for
-occurrence-specific external receipts. Overlap follows the existing concurrency
-settings. Idempotent occurrence records retain the same permanent retention policy
-as ordinary idempotent jobs.
+Each occurrence gets a distinct execution ID that survives its retries. Memory and Redis
+scope active deduplication and durable idempotency to that occurrence; their idempotent
+occurrence records retain the same retention policy as ordinary idempotent jobs.
+Temporal gives each occurrence a separate workflow and removes ordinary dedupe/idempotency
+keys from its policy, so its scheduled outcomes follow namespace history retention.
+Use the execution ID from hooks for occurrence-specific external receipts. Handler overlap
+is bounded by the existing per-worker concurrency settings.
+
+Temporal's schedule service can enqueue occurrences while application workers are offline.
+Catch-up after a Temporal service outage follows its schedule policy; the adapter leaves
+the provider's catch-up setting at its default. This differs from Redis's pending-occurrence behavior.
 
 Memory supports the same timing API, but its schedules disappear on backend close
 or process exit. Redis durability depends on its configured persistence.
 
 ## Serialization and cancellation
 
-Both backends use the same `JsonCodec` by default. It supports plain JSON records,
+All job systems use `JsonCodec` by default, independently of their backend. It supports plain JSON records,
 arrays, strings, booleans, finite numbers, null, and a top-level undefined value.
 It rejects values whose meaning JSON would change: Date/class instances, functions,
 bigints, symbols, nonfinite numbers, negative zero, sparse arrays, extra array
@@ -427,7 +460,8 @@ records do not produce false idempotency conflicts. A custom `codec` can support
 `encode(value): string` and `decode(encoded): unknown` must preserve those values.
 Its encoding must also be deterministic when used with idempotency keys.
 
-Only an ID, job name, and encoded input cross the backend boundary. Classes,
+Messages crossing the backend boundary contain an ID, job name, encoded input, delivery
+policy, and optional delivery timestamp. Recurring registrations also carry a timing rule. Classes,
 service instances and AbortSignal objects stay in the worker. Invalid input encoding
 fails before submission; invalid output encoding becomes a terminal failed outcome.
 
@@ -438,7 +472,9 @@ const output = await updateMemory(input).result({ signal: AbortSignal.timeout(5_
 Caller signals cancel waiting only. Submission has no signal: once a job is called,
 the work is submitted unless startup or the backend fails. An accepted job may
 execute even if the caller stops waiting or closes, and the same handle can wait
-again later. There is no remote cancellation protocol in this version.
+again later while the system remains open. The core API has no remote cancellation method.
+Temporal users can request workflow cancellation through their Temporal client; the adapter
+passes Activity cancellation to the handler's signal.
 The handler's final AbortSignal belongs to the worker/backend, not the waiting
 caller. Providers may use it for observed execution loss; it cannot undo effects
 or forcibly interrupt JavaScript.
@@ -485,7 +521,7 @@ bounds. A network submission failure can leave acceptance uncertain.
 
 Redis recovery can execute work more than once, especially after a crash between
 an external side effect and outcome persistence. Handlers with external effects
-should pass the persisted operation ID to downstream idempotency mechanisms. Neither backend
+should pass the persisted operation ID to downstream idempotency mechanisms. No backend
 promises exactly-once external effects. Redis durability also depends on the Redis
 server's persistence configuration.
 
@@ -506,7 +542,8 @@ type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: number) =
 Backend inputs/outputs are data-only envelopes;
 core keeps catalog typing, serialization, DI, hooks, and timeouts. A backend owns
 worker admission, acceptance, delivery, retries, recovery, retention,
-result waiting, acknowledgments and its connections. Each message carries its
+result waiting, acknowledgments and owned connections. Borrowed connections remain the
+application's responsibility. Each message carries its
 `policy`: total attempts, backoff, and an optional active dedupe key or durable
 idempotency key. Core derives a stable ID from the registration name and
 idempotency key. A backend must atomically reserve that ID, reject changed inputs,
@@ -542,7 +579,7 @@ independent. Providers supporting recurrence implement `JobSchedules.upsert`,
 or cron plus timezone). The provider owns durable registration identity and
 occurrence advancement. Providers without this capability reject recurring calls.
 
-Memory and Redis/BullMQ are implemented. An SQS or RabbitMQ adapter may need an
+Memory, Redis/BullMQ, and Temporal are implemented. An SQS or RabbitMQ adapter may need an
 additional result store; a queue alone is not the complete backend. The core does
 not assume a universal visibility lease, transaction protocol or pub/sub mechanism.
 
@@ -553,11 +590,16 @@ the Redis adapter's owned connections and draining lifecycle.
 
 ## Verification
 
-`pnpm test` builds the packages and runs core behavior and emitted-type checks.
-Redis integration tests skip unless a dedicated Redis is supplied:
+`pnpm test` builds all packages, runs core behavior and emitted-type checks, and runs
+Temporal integration tests. Temporal tests start their own local servers, need permission
+to open local sockets, and download server executables on first use; they do not skip.
+To run only core after building, use `pnpm --filter core test`.
+
+Most Redis integration tests skip unless a dedicated Redis port is supplied.
+The Redis server-crash test separately requires the server executable:
 
 ```sh
-JOB_SYSTEM_REDIS_PORT=16379 pnpm --filter core test
+JOB_SYSTEM_REDIS_PORT=16379 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm --filter core test
 ```
 
 Use an isolated test Redis. Tests use unique queue names and delete only their own

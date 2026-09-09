@@ -4,6 +4,8 @@ Exactly six top-level tests, numbered to match the agreed gaps. All six pass.
 They are separate from the existing regression
 suite; no tests use `skip`, `todo`, unconditional failure, or feature-detection fallbacks.
 Passing establishes these scenarios, not proof against every possible failure.
+These contracts exercise memory and Redis; Temporal has its own integration suite
+in `packages/temporal-backend/test`.
 
 ```sh
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance
