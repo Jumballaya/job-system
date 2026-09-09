@@ -223,21 +223,77 @@ try {
 }
 ```
 
-Calling a job is the only way to execute it. The first call starts one worker,
-then every call submits through the selected backend. Concurrent first calls share
-startup; inputs are snapshotted before waiting. Set `concurrency` at creation
-(default: 1).
+`createJobSystem(...)` attaches the catalog and starts one local worker immediately.
+Initialization is synchronous; backend startup happens in the background. The worker
+consumes existing and future work without a local submission. Calling a job snapshots
+its input, waits for startup internally, and submits through the backend.
+Set `concurrency` at creation (default: 1).
 
 Each system owns its backend and worker. Systems using the same Redis queue can
 share work; they must have compatible catalogs and codecs, and each needs its own
 configured dependency container. Worker startup and terminal worker failures reject
-calls and pending results; create a new system after worker failure. There is no
-separate producer-only or worker-only mode on `JobSystem`.
+calls and pending results; create a new system after worker failure. A container is
+optional for jobs without dependencies and for submit-only systems. Background startup
+failures are retained and reject subsequent calls and `close()`.
+
+## Run workers separately
+
+In an API or other producer process, register the catalog with `worker: false`:
+
+```ts
+const jobs = createJobSystem({
+  jobs: { updateMemory },
+  backend: new RedisBackend(redisOptions),
+  worker: false,
+});
+
+const handle = await updateMemory(input);
+const output = await handle.result(); // optional; waits for a remote worker
+```
+
+This process never starts a consumer or resolves handler dependencies. It can
+submit while workers are offline, then close once acceptance is acknowledged.
+Closing a producer stops its local result waits; jobs already accepted by Redis
+remain queued for other processes.
+
+In the worker process, use the same queue, catalog names, and codec, and register
+the services needed by the handlers:
+
+```ts
+const jobs = createJobSystem({
+  container,
+  jobs: { updateMemory },
+  backend: new RedisBackend(redisOptions),
+  concurrency: 4,
+});
+
+// The worker starts during initialization and consumes queued work automatically.
+// Call this from the app's existing shutdown handler:
+await jobs.close();
+```
+
+There is no separate startup call or worker handle to manage. A restarted process
+begins consuming as soon as it initializes its system. Call `jobs.close()` from your
+app's shutdown handler; see the runnable [demo worker](packages/app/src/worker.ts).
+
+To try it with two terminals after `docker compose up -d`:
+
+```sh
+# Terminal 1: consume jobs continuously
+pnpm worker
+
+# Terminal 2: the existing demo submits everything to the remote worker
+JOB_WORKER=remote pnpm start
+```
+
+The demo uses the same catalog in both processes. A single worker makes its
+process-local counter and retry examples predictable. `JOB_BACKEND=memory` remains
+available for the combined demo; memory does not share work across processes.
 
 `jobs.close()` stops intake, drains active work, rejects local result waits, and
 releases backend resources. Closing is idempotent and prevents new runs. It cannot
 retract work already accepted remotely, and draining can wait indefinitely for a
-handler that never finishes. Closing an unused system does not start a worker.
+handler that never finishes. Closing during startup waits for and closes the worker.
 
 For jobs without `idempotencyKey`, the memory backend retains results for 60 seconds and at most 1,000 completed jobs;
 configure its age using `new MemoryBackend({ resultTTLms: ... })`. Redis retains

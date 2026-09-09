@@ -190,11 +190,12 @@ export class JobSystem {
   private worker?: Promise<JobWorker>;
   private closing?: Promise<void>;
 
-  constructor(private readonly container: Container, jobs: Readonly<Record<string, AnyJob>>, options: { backend: JobBackend; codec?: JobCodec; concurrency?: number }) {
+  constructor(private readonly container: Container, jobs: Readonly<Record<string, AnyJob>>, options: { backend: JobBackend; codec?: JobCodec; concurrency?: number; worker?: boolean }) {
     if (!options?.backend) throw new Error("A job backend is required");
     this.backend = options.backend;
     this.codec = options.codec ?? new JsonCodec();
     this.concurrency = options.concurrency ?? 1;
+    if (options.worker !== undefined && typeof options.worker !== "boolean") throw new Error("worker must be a boolean");
     if (!Number.isSafeInteger(this.concurrency) || this.concurrency < 1) throw new Error("concurrency must be a positive safe integer");
     if (!jobs || typeof jobs !== "object" || Array.isArray(jobs) ||
       Object.getOwnPropertySymbols(jobs).some((key) => Object.prototype.propertyIsEnumerable.call(jobs, key))) {
@@ -216,9 +217,13 @@ export class JobSystem {
     for (const [name, { job }] of this.catalog) {
       attachments.set(job, { owner: this, submit: (input) => this.submit(name, input) });
     }
+    if (options.worker !== false) {
+      this.worker = this.openWorker();
+      // Startup can fail before any caller arrives; retain the failure for calls and shutdown.
+      void this.worker.catch((error: unknown) => this.shutdown.abort(error));
+    }
   }
 
-  /** Start processing as needed and submit through the backend. */
   private submit(name: string, input: unknown): JobSubmission<unknown> {
     const pending = (async (): Promise<JobHandle<unknown>> => {
       this.assertOpen();
@@ -234,7 +239,7 @@ export class JobSystem {
         ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
       };
       const message: JobMessage = prepareSubmission({ id: crypto.randomUUID(), name, input: this.codec.encode(input), policy });
-      await (this.worker ??= this.openWorker());
+      await this.worker;
       this.assertOpen();
       const id = await this.backend.submit(message);
       return Object.freeze({ id, result: (options?: WaitOptions) => this.result(id, options) });
@@ -344,13 +349,15 @@ function failure(error: unknown): JobFailure {
   return { name: "Error", message: typeof error === "string" ? error : "Job failed with a non-Error value" };
 }
 
-/** Attach the catalog to a backend. Definitions become callable until the system closes. */
+/** Attaches jobs and starts consuming immediately; close the system during app shutdown. */
 export function createJobSystem(options: {
-  container: Container;
+  container?: Container;
   jobs: Readonly<Record<string, AnyJob>>;
   backend: JobBackend;
   codec?: JobCodec;
   concurrency?: number;
+  /** False submits to remote workers without starting a local worker or resolving dependencies. */
+  worker?: boolean;
 }): JobSystem {
-  return new JobSystem(options.container, options.jobs, options);
+  return new JobSystem(options.container ?? new Container(), options.jobs, options);
 }

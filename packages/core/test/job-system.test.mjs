@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Container, createJobSystem, defineJob, JobExecutionError, JsonCodec, MemoryBackend, NonRetryableError } from "../dist/index.js";
 
-test("calling a definition starts processing and retains one job ID across hooks", async (t) => {
+test("calling a definition submits work and retains one job ID across hooks", async (t) => {
   const contexts = [];
   const add = defineJob({
     deps: [],
@@ -288,7 +288,7 @@ test("simultaneous first submissions share startup and snapshot inputs before wa
   assert.equal(submissions, 2);
 });
 
-test("invalid inputs and unattached jobs do not start a worker or submit work", async (t) => {
+test("invalid inputs and unattached jobs never submit work", async (t) => {
   let starts = 0;
   class Backend extends MemoryBackend {
     async work(...args) { starts++; return super.work(...args); }
@@ -301,7 +301,7 @@ test("invalid inputs and unattached jobs do not start a worker or submit work", 
   await assert.rejects(echo(1n), TypeError);
   await assert.rejects(stray(1), /not attached/);
   await assert.rejects(stray(1).result(), /not attached/);
-  assert.equal(starts, 0);
+  assert.equal(starts, 1);
 });
 
 test("startup failures reject submissions without submitting and still release backend resources", async () => {

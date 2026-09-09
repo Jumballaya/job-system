@@ -1,5 +1,5 @@
-import { Container, createJobSystem, defineJob, JobExecutionError } from "core";
-import { createBackend } from "./backend.js";
+import { defineJob, JobExecutionError } from "core";
+import { createDemoSystem } from "./system.js";
 import { add } from "./jobs/add.js";
 import { audit } from "./jobs/audit.js";
 import { explode } from "./jobs/explode.js";
@@ -7,27 +7,7 @@ import { flaky } from "./jobs/flaky.js";
 import { sleep } from "./jobs/sleep.js";
 import { stall } from "./jobs/stall.js";
 import { syncUser } from "./jobs/sync.js";
-import { Counter } from "./services/counter.js";
-import { Auditor, RequestScope } from "./services/request-scope.js";
-
-const container = new Container();
-container.register(Counter);
-container.register(RequestScope, {
-  useFactory: () => new RequestScope(),
-  lifetime: "scoped",
-});
-container.register(Auditor, {
-  useFactory: (resolver) => new Auditor(resolver.resolve(RequestScope)),
-  lifetime: "scoped",
-});
-
-const { backend, label } = createBackend();
-const jobs = createJobSystem({
-  container,
-  jobs: { add, audit, sleep, explode, flaky, stall, syncUser },
-  backend,
-  concurrency: 4,
-});
+const { jobs, label } = createDemoSystem(process.env.JOB_WORKER !== "remote");
 console.log(`Backend: ${label}`);
 
 function section(title: string): void {

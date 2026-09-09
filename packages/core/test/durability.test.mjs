@@ -131,14 +131,14 @@ test("a worker killed after database commit is recovered by another process with
     finally { await inspector.close(); ledger.close(); }
   });
   const doomed = worker(cleanup, queue, filename, "crash");
-  await doomed.message("ready");
+  await doomed.message("initialized");
   const id = await backend.submit(message());
   assert.deepEqual((await doomed.message("committed")).output, { balance: 25 });
   await stop(doomed.child);
   assert.equal(await (await inspector.getJob(`job-${id}`)).getState(), "active", "the dead worker never acknowledged completion");
   assert.deepEqual(ledger.inspect(), { deliveries: 1, receipts: 1, balance: 25 });
   const replacement = worker(cleanup, queue, filename, "recover");
-  await replacement.message("ready");
+  await replacement.message("initialized");
   assert.equal(await backend.submit(message()), id, "uncertain acceptance is safe to resubmit");
   const outcome = await backend.result(id, { signal: AbortSignal.timeout(90_000) });
   assert.deepEqual(new JsonCodec().decode(outcome.output), { balance: 25 });

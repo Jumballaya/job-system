@@ -13,14 +13,12 @@ const credit = defineJob({
   },
   metadata: { idempotencyKey: (input) => JSON.stringify([input.tenant, input.operation]) },
 });
-const ready = defineJob({ deps: [], handler() {} });
 const jobs = createJobSystem({
   container: new Container().register(Ledger, { useValue: ledger }),
-  jobs: { credit, ready },
+  jobs: { credit },
   backend: new RedisBackend({ queue, connection: { host: "127.0.0.1", port: Number(process.env.JOB_SYSTEM_REDIS_PORT) } }),
 });
-await ready(null).result();
-process.send({ kind: "ready" });
+process.send({ kind: "initialized" });
 process.once("message", async () => {
   await jobs.close();
   ledger.close();

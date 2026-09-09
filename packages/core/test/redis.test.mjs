@@ -61,17 +61,43 @@ function launch(t, role, queue) {
 test("separate producer and worker processes exchange retained results", redis, async (t) => {
   const env = fixture(t);
   const worker = launch(t, "worker", env.queue);
-  const ready = await worker.message("ready");
+  const initialized = await worker.message("initialized");
   const producer = launch(t, "producer", env.queue);
   const completed = await producer.message("completed");
-  assert.notEqual(completed.producerPid, ready.workerPid);
-  assert.notEqual(ready.workerPid, process.pid);
-  assert.deepEqual(new JsonCodec().decode(completed.outcome.output), { value: 42, workerPid: ready.workerPid });
+  assert.notEqual(completed.producerPid, initialized.workerPid);
+  assert.notEqual(initialized.workerPid, process.pid);
+  assert.deepEqual(new JsonCodec().decode(completed.outcome.output), { value: 42, workerPid: initialized.workerPid });
+  assert.deepEqual(completed.output, { value: 42, workerPid: initialized.workerPid });
   assert.deepEqual(completed.late, completed.outcome);
   const workerExit = once(worker.child, "exit");
   worker.child.send("close");
   assert.equal((await workerExit)[0], 0);
   if (producer.child.exitCode === null) assert.equal((await once(producer.child, "exit"))[0], 0);
+});
+
+test("fresh and replacement workers consume work left by exited submit-only processes without local submissions", redis, async (t) => {
+  const env = fixture(t);
+  const reader = env.backend();
+  const inspector = new Queue(env.queue, { connection: { host: "127.0.0.1", port } });
+  t.after(() => inspector.close());
+  const workerPids = [];
+  for (let cycle = 0; cycle < 2; cycle++) {
+    const producer = launch(t, "submit", env.queue);
+    const accepted = await producer.message("accepted");
+    if (producer.child.exitCode === null) assert.equal((await once(producer.child, "exit"))[0], 0);
+    else assert.equal(producer.child.exitCode, 0);
+    assert.equal(await (await inspector.getJob(`job-${accepted.id}`)).getState(), "waiting");
+    const worker = launch(t, "worker", env.queue);
+    const initialized = await worker.message("initialized");
+    workerPids.push(initialized.workerPid);
+    const outcome = await reader.result(accepted.id, { signal: AbortSignal.timeout(5_000) });
+    assert.deepEqual(new JsonCodec().decode(outcome.output), { value: 42, workerPid: initialized.workerPid });
+    const exited = once(worker.child, "exit");
+    worker.child.send("close");
+    assert.equal((await exited)[0], 0);
+  }
+  assert.notEqual(workerPids[0], workerPids[1]);
+  assert.equal(await inspector.getCompletedCount(), 2, "workers must not submit bootstrap jobs");
 });
 
 test("identical submissions share one execution and conflicting IDs reject", redis, async (t) => {

@@ -86,8 +86,12 @@ add("wrong");
 const wrongOutput: Promise<string> = add({ amount: 1 }).result();
 // @ts-expect-error There is no name-based submission API.
 jobs.run("counter.add", { amount: 1 });
-// @ts-expect-error Worker startup is internal.
+// @ts-expect-error Initialization starts the worker; there is no separate start step.
 jobs.start();
+const producer = createJobSystem({ jobs: { add }, backend: new MemoryBackend(), worker: false });
+// @ts-expect-error Worker selection must be boolean.
+createJobSystem({ jobs: { add }, backend: new MemoryBackend(), worker: "off" });
+void producer;
 void [handle, count, text, wrongOutput];
 
 // @ts-expect-error Only definitions from defineJob form a catalog.

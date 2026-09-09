@@ -1,4 +1,4 @@
-import { Container, createJobSystem, defineJob, JsonCodec, RedisBackend } from "../dist/index.js";
+import { Container, createJobSystem, defineJob, RedisBackend } from "../dist/index.js";
 
 const [role, queue] = process.argv.slice(2);
 const backend = new RedisBackend({
@@ -6,36 +6,41 @@ const backend = new RedisBackend({
   connection: { host: "127.0.0.1", port: Number(process.env.JOB_SYSTEM_REDIS_PORT) },
 });
 
+class Multiplier {
+  multiply(value) { return { value: value * 2, workerPid: process.pid }; }
+}
+const double = defineJob({ deps: [Multiplier], handler: (input, multiplier) => multiplier.multiply(input) });
+
 if (role === "worker") {
-  const localHandler = defineJob({
-    deps: [], handler: (input) => ({ value: input * 2, workerPid: process.pid }),
-  });
-  const ready = defineJob({ deps: [], handler() {} });
-  const jobs = createJobSystem({ container: new Container(), jobs: { ready, double: localHandler }, backend });
-  await ready(null).result();
-  process.send({ kind: "ready", workerPid: process.pid });
+  const jobs = createJobSystem({ container: new Container().register(Multiplier), jobs: { double }, backend });
+  process.send({ kind: "initialized", workerPid: process.pid });
   process.once("message", async () => {
     await jobs.close();
     process.disconnect();
   });
 } else {
-  const message = { id: crypto.randomUUID(), name: "double", input: new JsonCodec().encode(21), policy: { attempts: 1, backoff: { type: "fixed", delay: 0 } } };
+  const jobs = createJobSystem({ jobs: { double }, backend, worker: false });
   try {
-    await backend.submit(message);
-    const outcome = await backend.result(message.id);
-    await backend.close();
-    const reader = new RedisBackend({
-      queue,
-      connection: { host: "127.0.0.1", port: Number(process.env.JOB_SYSTEM_REDIS_PORT) },
-    });
-    try {
-      const late = await reader.result(message.id);
-      process.send({ kind: "completed", producerPid: process.pid, outcome, late });
-    } finally {
-      await reader.close();
+    const handle = await double(21);
+    if (role === "submit") {
+      process.send({ kind: "accepted", id: handle.id });
+    } else {
+      const output = await handle.result();
+      const outcome = await backend.result(handle.id);
+      await jobs.close();
+      const reader = new RedisBackend({
+        queue,
+        connection: { host: "127.0.0.1", port: Number(process.env.JOB_SYSTEM_REDIS_PORT) },
+      });
+      try {
+        const late = await reader.result(handle.id);
+        process.send({ kind: "completed", producerPid: process.pid, output, outcome, late });
+      } finally {
+        await reader.close();
+      }
     }
   } finally {
-    await backend.close();
+    await jobs.close();
     process.disconnect();
   }
 }

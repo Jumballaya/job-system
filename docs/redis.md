@@ -21,10 +21,18 @@ const output = await updateMemory(input).result();
 await jobs.close();
 ```
 
-Calling `updateMemory` starts processing on first use and sends the job through
-Redis; `result()` awaits its output. Each system owns a worker; systems on the same queue share jobs and must
-use compatible catalogs and codecs with their own dependency containers. The
-lower-level backend contract also supports separate producer and worker processes.
+Calling `updateMemory` sends the job through Redis; `result()` awaits its output.
+`createJobSystem(...)` starts a local worker in the background immediately, so fresh
+or restarted processes consume queued work without a local submission. Job calls
+wait for startup internally. Systems on the same queue must use compatible catalogs
+and codecs; workers supply their own dependency containers.
+
+Pass `worker: false` to `createJobSystem` in producer processes. They keep the same
+typed calls and result handles, need no dependency container, and never consume
+jobs locally. Workers can initialize after the producer has exited. Call
+`jobs.close()` during app shutdown to drain work and release connections.
+See [separate workers](../README.md#run-workers-separately) for bootstrap examples
+and the two-process demo.
 
 Each job's `metadata.retries` becomes BullMQ `attempts` and `backoff` at submission,
 and `metadata.key`, scoped by the registration key, becomes a BullMQ deduplication id that is held while the job is
@@ -70,8 +78,9 @@ JOB_SYSTEM_REDIS_PORT=16379 pnpm --filter core test
 ```
 
 Integration tests create unique queues and remove only their own queues. The suite
-includes separate producer and worker processes and a fresh reader of a completed
-result, conflicting operation submissions, retention, and a worker killed after a
+includes submit-only producer processes that exit before fresh and replacement
+workers start, a fresh reader of a completed result, conflicting operation
+submissions, retention, and a worker killed after a
 database commit. The crash test waits for BullMQ's real stalled-worker recovery,
 usually about a minute. Redis integration tests skip without the port variable.
 
