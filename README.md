@@ -199,6 +199,10 @@ dependencies remain cached. The container does not automatically dispose resourc
 
 ## Choose a backend
 
+For an existing Temporal deployment, use `TemporalBackend` from the optional
+[`temporal-backend` package](packages/temporal-backend/README.md). It accepts your
+Temporal client and worker connection; job definitions and calls stay the same.
+
 A backend is required. Import `MemoryBackend` from `core` and pass
 `backend: new MemoryBackend()` for in-process execution. To use Redis, import `RedisBackend`
 from `core` and pass it instead; job definitions stay unchanged:

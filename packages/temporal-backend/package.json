@@ -1,0 +1,33 @@
+{
+  "name": "temporal-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./workflows": {
+      "types": "./dist/workflows.d.ts",
+      "import": "./dist/workflows.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@temporalio/activity": "1.23.0",
+    "@temporalio/client": "1.23.0",
+    "@temporalio/worker": "1.23.0",
+    "@temporalio/workflow": "1.23.0",
+    "core": "workspace:*"
+  },
+  "devDependencies": {
+    "@temporalio/testing": "1.23.0",
+    "@types/node": "^24.13.3"
+  }
+}

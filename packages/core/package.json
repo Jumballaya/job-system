@@ -8,7 +8,9 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./backend": { "types": "./dist/backend.d.ts", "import": "./dist/backend.js" },
+    "./scheduling": { "types": "./dist/scheduling.d.ts", "import": "./dist/scheduling.js" }
   },
   "files": [
     "dist"
