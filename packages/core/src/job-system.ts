@@ -29,12 +29,11 @@ export interface JobMetadata<Input = unknown> {
   readonly timeout?: number;
   /** Simultaneous executions of this job within one process; the system's concurrency still applies. */
   readonly concurrency?: number;
-  /** Derives a dedupe key from the input; submitting while that key is active reuses the active job. */
+  /** Derives a key scoped to this job's registration; submitting while active reuses that job. */
   readonly key?: (input: NoInfer<Input>) => string;
 }
 
-export interface JobDefinition<Name extends string, Deps extends readonly Constructor[], Input, Output> {
-  readonly name: Name;
+export interface JobDefinition<Deps extends readonly Constructor[], Input, Output> {
   readonly deps: Deps;
   readonly metadata?: JobMetadata<Input>;
   readonly handler: (input: Input, ...args: [...Instances<Deps>, AbortSignal]) => Output;
@@ -56,15 +55,13 @@ export type JobSubmission<Output> = Promise<JobHandle<Output>> & {
 };
 
 /** A definition is called to submit work; it must be attached to a system first. */
-export type Job<Name extends string, Deps extends readonly Constructor[], Input, Output> = {
+export type Job<Deps extends readonly Constructor[], Input, Output> = {
   (input: Input): JobSubmission<Awaited<Output>>;
-  readonly name: Name;
-  readonly definition: JobDefinition<Name, Deps, Input, Output>;
+  readonly definition: JobDefinition<Deps, Input, Output>;
 };
 
 // Heterogeneous definitions are erased only inside dispatch; each job keeps its own input pairing.
 type AnyDefinition = {
-  readonly name: string;
   readonly deps: readonly Constructor[];
   readonly metadata?: JobMetadata<any>;
   readonly handler: (...args: any[]) => unknown;
@@ -74,7 +71,6 @@ type AnyDefinition = {
 };
 type AnyJob = {
   (input: any): JobSubmission<unknown>;
-  readonly name: string;
   readonly definition: AnyDefinition;
 };
 
@@ -93,7 +89,7 @@ export const defaultMetadata = Object.freeze({
   concurrency: Infinity,
 } as const);
 
-function resolveMetadata(name: string, metadata: JobMetadata<any> = {}): ResolvedMetadata {
+function resolveMetadata(metadata: JobMetadata<any> = {}): ResolvedMetadata {
   const attempts = metadata.retries?.attempts ?? defaultMetadata.retries.attempts;
   const backoff = metadata.retries?.backoff ?? defaultMetadata.retries.backoff;
   const resolved: ResolvedMetadata = {
@@ -103,7 +99,7 @@ function resolveMetadata(name: string, metadata: JobMetadata<any> = {}): Resolve
     concurrency: metadata.concurrency ?? defaultMetadata.concurrency,
     ...(metadata.key ? { key: metadata.key } : {}),
   };
-  const invalid = (field: string, requirement: string) => new Error(`Job "${name}" metadata ${field} must be ${requirement}`);
+  const invalid = (field: string, requirement: string) => new Error(`Job metadata ${field} must be ${requirement}`);
   if (!Number.isSafeInteger(resolved.attempts) || resolved.attempts < 1) throw invalid("retries.attempts", "a positive integer");
   if (!["fixed", "exponential"].includes(resolved.backoff.type)) throw invalid("retries.backoff.type", "fixed or exponential");
   if (!Number.isFinite(resolved.backoff.delay) || resolved.backoff.delay < 0) throw invalid("retries.backoff.delay", "a nonnegative number");
@@ -125,23 +121,20 @@ function submission<Output>(pending: Promise<JobHandle<Output>>): JobSubmission<
   });
 }
 
-/** Preserve literal names and dependency tuples; no container or execution is needed here. */
-export function defineJob<const Name extends string, const Deps extends readonly Constructor[], Input, Output>(
-  definition: JobDefinition<Name, Deps, Input, Output>,
-): Job<Name, Deps, Input, Output> {
-  resolveMetadata(definition.name, definition.metadata);
+/** Define a callable job; its registration key supplies the identity used for delivery. */
+export function defineJob<const Deps extends readonly Constructor[], Input, Output>(
+  definition: JobDefinition<Deps, Input, Output>,
+): Job<Deps, Input, Output> {
+  resolveMetadata(definition.metadata);
   const frozen = Object.freeze({ ...definition, deps: Object.freeze([...definition.deps]) as unknown as Deps });
   const job = ((input: Input) => {
     const attachment = attachments.get(job);
     if (!attachment) {
-      return submission(Promise.reject(new Error(`Job "${frozen.name}" is not attached to a job system; pass it to createJobSystem first`)));
+      return submission(Promise.reject(new Error("Job is not attached to a job system; pass it to createJobSystem first")));
     }
     return attachment.submit(input);
-  }) as Job<Name, Deps, Input, Output>;
-  Object.defineProperties(job, {
-    name: { value: frozen.name, enumerable: true },
-    definition: { value: frozen, enumerable: true },
-  });
+  }) as Job<Deps, Input, Output>;
+  Object.defineProperty(job, "definition", { value: frozen, enumerable: true });
   return Object.freeze(job);
 }
 
@@ -175,37 +168,44 @@ export class JobSystem {
   private worker?: Promise<JobWorker>;
   private closing?: Promise<void>;
 
-  constructor(private readonly container: Container, jobs: readonly AnyJob[], options: { backend: JobBackend; codec?: JobCodec; concurrency?: number }) {
+  constructor(private readonly container: Container, jobs: Readonly<Record<string, AnyJob>>, options: { backend: JobBackend; codec?: JobCodec; concurrency?: number }) {
     if (!options?.backend) throw new Error("A job backend is required");
     this.backend = options.backend;
     this.codec = options.codec ?? new JsonCodec();
     this.concurrency = options.concurrency ?? 1;
     if (!Number.isSafeInteger(this.concurrency) || this.concurrency < 1) throw new Error("concurrency must be a positive safe integer");
-    for (const job of jobs) {
-      if (typeof job !== "function" || typeof job.definition !== "object") throw new Error("Jobs must be created with defineJob");
-      if (!job.name.trim()) throw new Error("Job names must not be empty");
-      if (this.catalog.has(job.name)) throw new Error(`Duplicate job name: ${job.name}`);
+    if (!jobs || typeof jobs !== "object" || Array.isArray(jobs) ||
+      Object.getOwnPropertySymbols(jobs).some((key) => Object.prototype.propertyIsEnumerable.call(jobs, key))) {
+      throw new Error("Jobs must be an object with string registration keys");
+    }
+    const registered = new Set<AnyJob>();
+    for (const [name, job] of Object.entries(jobs)) {
+      if (!name.trim()) throw new Error("Job registration keys must not be empty");
+      if (typeof job !== "function" || !job.definition || typeof job.definition !== "object") throw new Error("Jobs must be created with defineJob");
+      if (registered.has(job)) throw new Error(`Job registered more than once: ${name}`);
+      registered.add(job);
       const owner = attachments.get(job)?.owner;
-      if (owner && !owner.closing) throw new Error(`Job "${job.name}" is already attached to another job system`);
-      const metadata = resolveMetadata(job.name, job.definition.metadata);
+      if (owner && !owner.closing) throw new Error(`Job "${name}" is already attached to another job system`);
+      const metadata = resolveMetadata(job.definition.metadata);
       const gate = metadata.concurrency === Infinity ? undefined : new Gate(metadata.concurrency);
-      this.catalog.set(job.name, { job, metadata, gate });
+      this.catalog.set(name, { job, metadata, gate });
     }
     // Validate the whole catalog before attaching any of it, so a rejected system attaches nothing.
-    for (const { job } of this.catalog.values()) {
-      attachments.set(job, { owner: this, submit: (input) => this.submit(job, input) });
+    for (const [name, { job }] of this.catalog) {
+      attachments.set(job, { owner: this, submit: (input) => this.submit(name, input) });
     }
   }
 
   /** Start processing as needed and submit through the backend. */
-  private submit(job: AnyJob, input: unknown): JobSubmission<unknown> {
+  private submit(name: string, input: unknown): JobSubmission<unknown> {
     const pending = (async (): Promise<JobHandle<unknown>> => {
       this.assertOpen();
-      const { metadata } = this.catalog.get(job.name)!;
+      const { metadata } = this.catalog.get(name)!;
       const key = metadata.key?.(input);
-      if (key !== undefined && (typeof key !== "string" || !key)) throw new Error(`Job "${job.name}" key must be a nonempty string`);
-      const policy: JobPolicy = { attempts: metadata.attempts, backoff: metadata.backoff, ...(key !== undefined ? { key } : {}) };
-      const message: JobMessage = Object.freeze({ id: crypto.randomUUID(), name: job.name, input: this.codec.encode(input), policy });
+      if (key !== undefined && (typeof key !== "string" || !key)) throw new Error(`Job "${name}" key must be a nonempty string`);
+      // Tuple encoding prevents collisions between job names and user keys containing separators.
+      const policy: JobPolicy = { attempts: metadata.attempts, backoff: metadata.backoff, ...(key !== undefined ? { key: JSON.stringify([name, key]) } : {}) };
+      const message: JobMessage = Object.freeze({ id: crypto.randomUUID(), name, input: this.codec.encode(input), policy });
       await (this.worker ??= this.openWorker());
       this.assertOpen();
       const id = await this.backend.submit(message);
@@ -316,7 +316,7 @@ function failure(error: unknown): JobFailure {
 /** Attach the catalog to a backend. Definitions become callable until the system closes. */
 export function createJobSystem(options: {
   container: Container;
-  jobs: readonly AnyJob[];
+  jobs: Readonly<Record<string, AnyJob>>;
   backend: JobBackend;
   codec?: JobCodec;
   concurrency?: number;

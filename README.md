@@ -23,7 +23,6 @@ import { MemoryStore, EmbeddingClient } from "./services.js";
 type UpdateMemoryInput = { id: string; text: string };
 
 export const updateMemory = defineJob({
-  name: "memory.update",
   deps: [MemoryStore, EmbeddingClient],
 
   async handler(input: UpdateMemoryInput, memory, embeddings, signal) {
@@ -60,7 +59,6 @@ Every job carries a policy. The defaults are meant for production and apply when
 
 ```ts
 export const sendEmail = defineJob({
-  name: "email.send",
   deps: [Mailer],
 
   async handler(input: { userId: string }, mailer, signal) { ... },
@@ -99,8 +97,14 @@ const container = new Container();
 container.register(MemoryStore);
 container.register(EmbeddingClient);
 
-const jobs = createJobSystem({ container, jobs: [updateMemory], backend: new MemoryBackend() });
+const jobs = createJobSystem({ container, jobs: { updateMemory }, backend: new MemoryBackend() });
 ```
+
+Registration keys are the stable delivery names: `{ updateMemory }` uses
+`"updateMemory"` for Redis messages and `context.name`. Definitions need no `name`
+field. Producers and workers must use the same registration keys; object property
+order does not matter. Renaming a key changes the identity of queued work.
+Deduplication keys are automatically scoped to that registration key.
 
 That is the whole composition root. Anywhere else, import the job and call it:
 
@@ -118,10 +122,10 @@ fails, so a discarded call still surfaces submission errors as unhandled rejecti
 `result()` waits for the handler's output after lifecycle hooks finish and can be
 read repeatedly while the backend retains it. Input and output types come from the
 definition; a mismatched input is a compile error. Calling a job that is not
-attached to an open system rejects. Duplicate catalog names and jobs already
-attached elsewhere are rejected at setup. Runtime input validation is the
+attached to an open system rejects. Registering the same job under multiple keys
+or attaching it to another open system is rejected at setup. Runtime input validation is the
 application's responsibility when accepting external data. The catalog is fixed at
-creation; changing the original array does not change it.
+creation; changing the original registration object does not change it.
 
 The app is a walkthrough of the current behavior over Redis: shared singleton and
 per-execution scoped dependencies, fire-and-forget calls, concurrency, a caught
@@ -196,7 +200,7 @@ import { RedisBackend } from "core";
 
 const jobs = createJobSystem({
   container,
-  jobs: [updateMemory],
+  jobs: { updateMemory },
   concurrency: 4,
   backend: new RedisBackend({
     queue: "my-app",

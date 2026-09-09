@@ -2,7 +2,6 @@ import { defineJob } from "core";
 import { Counter } from "../services/counter.js";
 
 export const add = defineJob({
-  name: "counter.add",
   deps: [Counter],
 
   async handler(input: { amount: number }, counter, signal) {

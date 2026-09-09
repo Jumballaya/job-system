@@ -6,14 +6,17 @@ selection. The selected boundary is A, with explicit worker readiness and
 completion borrowed from D. This is a design record, not a claim that every
 discussed broker has an implemented adapter.
 
-The backend comparison below records the original design. The final caller API
+The backend comparison below records the original design. Current callers register
+`jobs: { sendEmail, syncUser }` and invoke the exported jobs directly. Registration
+keys supply delivery identity and deduplication scope. The historical API sketches
+below illustrate the design alternatives. The final caller API
 was subsequently simplified to `run(name, input)` plus resource cleanup with
 `close()`. Startup, submission, and result waiting are now internal; concurrency
 is configured at construction. A backend must be passed explicitly; there is no
 default strategy. Backend methods remain unchanged.
 
-The existing job definition owns its name, dependencies, handler, and lifecycle
-hooks. The job system owns typed dispatch and a dependency scope per execution.
+The job definition owns dependencies, handler, and lifecycle hooks. The registration
+object supplies each job's stable delivery name; definitions have no explicit name. The job system owns typed dispatch and a dependency scope per execution.
 The question is where delivery, retained results, and worker resources belong.
 
 | Design | Owns the difficult policy | What callers can forget | Main cost |

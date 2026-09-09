@@ -5,23 +5,22 @@ import { Container, createJobSystem, defineJob, JobExecutionError, JsonCodec, Me
 test("calling a definition starts processing and retains one job ID across hooks", async (t) => {
   const contexts = [];
   const add = defineJob({
-    name: "add", deps: [],
+    deps: [],
     handler: (input) => input + 1,
     beforeRun: (_input, context) => contexts.push(["before", context.jobId]),
     onSuccess: (_output, context) => contexts.push(["success", context.jobId]),
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [add] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { add } });
   t.after(() => jobs.close());
   const handle = await add(4);
   assert.equal(await handle.result(), 5);
   assert.equal(contexts[0][1], handle.id);
   assert.deepEqual(contexts, [["before", handle.id], ["success", handle.id]]);
-  assert.equal(add.name, "add");
 });
 
 test("a submission's result can be awaited directly, repeatedly, and after an aborted wait", async (t) => {
-  const echo = defineJob({ name: "echo", deps: [], handler: (input) => input });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [echo] });
+  const echo = defineJob({ deps: [], handler: (input) => input });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { echo } });
   t.after(() => jobs.close());
   assert.equal(await echo(1).result(), 1);
   const handle = await echo(2);
@@ -31,17 +30,17 @@ test("a submission's result can be awaited directly, repeatedly, and after an ab
 });
 
 test("definitions are callable only while attached to one open system", async () => {
-  const echo = defineJob({ name: "echo", deps: [], handler: (input) => input });
+  const echo = defineJob({ deps: [], handler: (input) => input });
   await assert.rejects(echo(1), /not attached/);
-  const first = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [echo] });
+  const first = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { echo } });
   assert.throws(
-    () => createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [echo] }),
+    () => createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { echo } }),
     /already attached/,
   );
   assert.equal(await echo(1).result(), 1);
   await first.close();
   await assert.rejects(echo(1), /not attached/);
-  const second = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [echo] });
+  const second = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { echo } });
   try {
     assert.equal(await echo(2).result(), 2);
   } finally {
@@ -50,15 +49,14 @@ test("definitions are callable only while attached to one open system", async ()
 });
 
 test("a rejected catalog attaches nothing", async () => {
-  const good = defineJob({ name: "good", deps: [], handler: (input) => input });
-  const bad = defineJob({ name: "good", deps: [], handler: (input) => input });
+  const good = defineJob({ deps: [], handler: (input) => input });
   assert.throws(
-    () => createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [good, bad] }),
-    /duplicate/i,
+    () => createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { good, alias: good } }),
+    /registered more than once/,
   );
   await assert.rejects(good(1), /not attached/);
   assert.throws(
-    () => createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [() => {}] }),
+    () => createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { invalid: () => {} } }),
     /defineJob/,
   );
 });
@@ -71,7 +69,7 @@ test("overlapping handlers share singletons while keeping scoped dependencies is
   const release = Promise.withResolvers();
   const seen = [];
   const inspect = defineJob({
-    name: "inspect", deps: [Shared, Scope, Scope],
+    deps: [Shared, Scope, Scope],
     async handler(input, shared, firstScope, secondScope) {
       seen.push({ shared, firstScope, secondScope });
       if (seen.length === 2) entered.resolve();
@@ -79,7 +77,7 @@ test("overlapping handlers share singletons while keeping scoped dependencies is
       return input;
     },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container, jobs: [inspect], concurrency: 2 });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container, jobs: { inspect }, concurrency: 2 });
   t.after(async () => { release.resolve(); await jobs.close(); });
   const first = inspect(1).result();
   const second = inspect(2).result();
@@ -95,11 +93,11 @@ test("handler failures are retained outcomes and invoke the error hook once", as
   let calls = 0;
   const hookErrors = [];
   const fail = defineJob({
-    name: "fail", deps: [], metadata: { retries: { attempts: 1 } },
+    deps: [], metadata: { retries: { attempts: 1 } },
     handler() { calls++; throw new TypeError("bad input"); },
     onError(error, context) { hookErrors.push([error.message, context.jobId]); },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [fail] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { fail } });
   t.after(() => jobs.close());
   const handle = await fail(null);
   await assert.rejects(handle.result(), (error) =>
@@ -113,12 +111,12 @@ test("success hook failure does not rerun work or invoke the error hook", async 
   let executed = 0;
   let errors = 0;
   const notify = defineJob({
-    name: "notify", deps: [],
+    deps: [],
     handler() { executed++; return "done"; },
     onSuccess() { throw new Error("notification failed"); },
     onError() { errors++; },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [notify] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { notify } });
   t.after(() => jobs.close());
   await assert.rejects(notify(null).result(), /notification failed/);
   assert.equal(executed, 1);
@@ -128,12 +126,12 @@ test("success hook failure does not rerun work or invoke the error hook", async 
 test("before and error hook failures become terminal results without running the handler", async (t) => {
   let executed = false;
   const hooks = defineJob({
-    name: "hooks", deps: [], metadata: { retries: { attempts: 1 } },
+    deps: [], metadata: { retries: { attempts: 1 } },
     handler() { executed = true; },
     beforeRun() { throw new Error("before failed"); },
     onError() { throw new Error("error hook failed"); },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [hooks] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { hooks } });
   t.after(() => jobs.close());
   await assert.rejects(hooks(null).result(), (error) => error instanceof JobExecutionError && error.failure.name === "AggregateError");
   assert.equal(executed, false);
@@ -145,7 +143,7 @@ test("cancelling a caller wait does not cancel its accepted handler", { timeout:
   let handlerSignal;
   let completed = false;
   const wait = defineJob({
-    name: "wait", deps: [],
+    deps: [],
     async handler(_input, signal) {
       handlerSignal = signal;
       entered.resolve();
@@ -154,7 +152,7 @@ test("cancelling a caller wait does not cancel its accepted handler", { timeout:
       return 7;
     },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [wait] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { wait } });
   t.after(async () => { release.resolve(); await jobs.close(); });
   const controller = new AbortController();
   const waiting = assert.rejects(wait(null).result({ signal: controller.signal }), /no longer waiting/);
@@ -170,8 +168,8 @@ test("cancelling a caller wait does not cancel its accepted handler", { timeout:
 test("unknown jobs and malformed payloads settle as failures without stopping the worker", async (t) => {
   const backend = new MemoryBackend();
   const codec = new JsonCodec();
-  const good = defineJob({ name: "good", deps: [], handler: (input) => input });
-  const jobs = createJobSystem({ container: new Container(), jobs: [good], backend });
+  const good = defineJob({ deps: [], handler: (input) => input });
+  const jobs = createJobSystem({ container: new Container(), jobs: { good }, backend });
   t.after(() => jobs.close());
   const policy = { attempts: 1, backoff: { type: "fixed", delay: 0 } };
   await backend.submit({ id: "unknown", name: "missing", input: codec.encode(null), policy });
@@ -183,8 +181,8 @@ test("unknown jobs and malformed payloads settle as failures without stopping th
 });
 
 test("unencodable outputs fail terminally and do not poison later executions", async (t) => {
-  const output = defineJob({ name: "output", deps: [], handler: (bad) => bad ? 1n : 5 });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [output] });
+  const output = defineJob({ deps: [], handler: (bad) => bad ? 1n : 5 });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { output } });
   t.after(() => jobs.close());
   await assert.rejects(output(true).result(), JobExecutionError);
   assert.equal(await output(false).result(), 5);
@@ -206,8 +204,8 @@ test("closing during worker startup drains the late worker and closes the backen
     },
     async close() { backendClosed++; },
   };
-  const job = defineJob({ name: "test", deps: [], handler() {} });
-  const jobs = createJobSystem({ container: new Container(), jobs: [job], backend });
+  const job = defineJob({ deps: [], handler() {} });
+  const jobs = createJobSystem({ container: new Container(), jobs: { job }, backend });
   const startupOutcome = assert.rejects(job(null), /closed/);
   await starting.promise;
   const closing = jobs.close();
@@ -232,8 +230,8 @@ test("shutdown releases the backend even when the worker fails and preserves bot
     },
     async close() { backendClosed++; throw backendError; },
   };
-  const job = defineJob({ name: "test", deps: [], handler() {} });
-  const jobs = createJobSystem({ container: new Container(), jobs: [job], backend });
+  const job = defineJob({ deps: [], handler() {} });
+  const jobs = createJobSystem({ container: new Container(), jobs: { job }, backend });
   await assert.rejects(job(null).result(), /unused/);
   const closing = jobs.close();
   assert.equal(jobs.close(), closing);
@@ -249,10 +247,10 @@ test("system closure rejects pending result waits before draining active handler
   const entered = Promise.withResolvers();
   const release = Promise.withResolvers();
   const drain = defineJob({
-    name: "drain", deps: [],
+    deps: [],
     async handler() { entered.resolve(); await release.promise; return "finished"; },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [drain] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { drain } });
   t.after(async () => { release.resolve(); await jobs.close(); });
   const waiting = assert.rejects(drain(null).result(), /clos/i);
   await entered.promise;
@@ -276,8 +274,8 @@ test("simultaneous first submissions share startup and snapshot inputs before wa
     }
     async submit(message) { submissions++; return super.submit(message); }
   }
-  const echo = defineJob({ name: "echo", deps: [], handler: (input) => input });
-  const jobs = createJobSystem({ container: new Container(), jobs: [echo], backend: new Backend() });
+  const echo = defineJob({ deps: [], handler: (input) => input });
+  const jobs = createJobSystem({ container: new Container(), jobs: { echo }, backend: new Backend() });
   t.after(async () => { ready.resolve(); await jobs.close(); });
   const input = { value: 1 };
   const first = echo(input).result();
@@ -296,9 +294,9 @@ test("invalid inputs and unattached jobs do not start a worker or submit work", 
     async work(...args) { starts++; return super.work(...args); }
     async submit() { assert.fail("must not submit invalid work"); }
   }
-  const echo = defineJob({ name: "echo", deps: [], handler: (input) => input });
-  const stray = defineJob({ name: "stray", deps: [], handler: (input) => input });
-  const jobs = createJobSystem({ container: new Container(), jobs: [echo], backend: new Backend() });
+  const echo = defineJob({ deps: [], handler: (input) => input });
+  const stray = defineJob({ deps: [], handler: (input) => input });
+  const jobs = createJobSystem({ container: new Container(), jobs: { echo }, backend: new Backend() });
   t.after(() => jobs.close());
   await assert.rejects(echo(1n), TypeError);
   await assert.rejects(stray(1), /not attached/);
@@ -316,8 +314,8 @@ test("startup failures reject submissions without submitting and still release b
     async result() { assert.fail("must not wait for unsubmitted work"); },
     async close() { closed++; },
   };
-  const job = defineJob({ name: "test", deps: [], handler() {} });
-  const jobs = createJobSystem({ container: new Container(), jobs: [job], backend });
+  const job = defineJob({ deps: [], handler() {} });
+  const jobs = createJobSystem({ container: new Container(), jobs: { job }, backend });
   await assert.rejects(job(null), (error) => error === failure);
   await assert.rejects(job(null).result(), (error) => error === failure);
   await assert.rejects(jobs.close(), (error) => error === failure);
@@ -336,8 +334,8 @@ test("worker failure rejects pending and future submissions instead of leaving w
       return { ...worker, done: stopped.promise };
     }
   }
-  const wait = defineJob({ name: "wait", deps: [], async handler() { entered.resolve(); await release.promise; } });
-  const jobs = createJobSystem({ container: new Container(), jobs: [wait], backend: new Backend() });
+  const wait = defineJob({ deps: [], async handler() { entered.resolve(); await release.promise; } });
+  const jobs = createJobSystem({ container: new Container(), jobs: { wait }, backend: new Backend() });
   t.after(async () => { release.resolve(); await jobs.close(); });
   const pending = assert.rejects(wait(null).result(), (error) => error === failure);
   await entered.promise;
@@ -350,7 +348,7 @@ test("retryable failures are redelivered with backoff until they succeed or exha
   const seen = [];
   let failures = 0;
   const flaky = defineJob({
-    name: "flaky", deps: [], metadata: { retries: { attempts: 3, backoff: { type: "fixed", delay: 1 } } },
+    deps: [], metadata: { retries: { attempts: 3, backoff: { type: "fixed", delay: 1 } } },
     handler(input) {
       if (failures < input.failures) { failures++; seen.push("fail"); throw new Error("transient"); }
       seen.push("ok");
@@ -359,7 +357,7 @@ test("retryable failures are redelivered with backoff until they succeed or exha
     beforeRun: (_input, context) => seen.push(`attempt ${context.attempt}/${context.maxAttempts}`),
     onError: (error, context) => seen.push(`error ${context.attempt}: ${error.message}`),
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [flaky] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { flaky } });
   t.after(() => jobs.close());
   assert.equal(await flaky({ failures: 2 }).result(), 2);
   assert.deepEqual(seen, [
@@ -375,15 +373,15 @@ test("retryable failures are redelivered with backoff until they succeed or exha
 test("NonRetryableError, success-hook failures, and malformed input never retry", async (t) => {
   let calls = 0;
   const stop = defineJob({
-    name: "stop", deps: [], metadata: { retries: { attempts: 5, backoff: { type: "fixed", delay: 0 } } },
+    deps: [], metadata: { retries: { attempts: 5, backoff: { type: "fixed", delay: 0 } } },
     handler() { calls++; throw new NonRetryableError("give up"); },
   });
   const hook = defineJob({
-    name: "hook", deps: [], metadata: { retries: { attempts: 5, backoff: { type: "fixed", delay: 0 } } },
+    deps: [], metadata: { retries: { attempts: 5, backoff: { type: "fixed", delay: 0 } } },
     handler() { calls++; return 1; },
     onSuccess() { throw new Error("notify failed"); },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [stop, hook] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { stop, hook } });
   t.after(() => jobs.close());
   await assert.rejects(stop(null).result(), (error) => error.failure.name === "NonRetryableError");
   await assert.rejects(hook(null).result(), /notify failed/);
@@ -393,7 +391,7 @@ test("NonRetryableError, success-hook failures, and malformed input never retry"
 test("a timeout aborts the handler's signal, fails the attempt, and allows a retry", async (t) => {
   const outcomes = [];
   const slow = defineJob({
-    name: "slow", deps: [], metadata: { timeout: 20, retries: { attempts: 2, backoff: { type: "fixed", delay: 0 } } },
+    deps: [], metadata: { timeout: 20, retries: { attempts: 2, backoff: { type: "fixed", delay: 0 } } },
     async handler(input, signal) {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(resolve, input.ms);
@@ -403,7 +401,7 @@ test("a timeout aborts the handler's signal, fails the attempt, and allows a ret
     },
     onError: (error, context) => outcomes.push([context.attempt, error.name, context.signal.aborted]),
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [slow] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { slow } });
   t.after(() => jobs.close());
   await assert.rejects(slow({ ms: 500 }).result(), (error) => error.failure.name === "TimeoutError");
   assert.deepEqual(outcomes, [[1, "TimeoutError", true], [2, "TimeoutError", true]]);
@@ -414,7 +412,7 @@ test("per-job concurrency bounds simultaneous executions within the system's lim
   let active = 0;
   let peak = 0;
   const limited = defineJob({
-    name: "limited", deps: [], metadata: { concurrency: 2 },
+    deps: [], metadata: { concurrency: 2 },
     async handler(input) {
       active++;
       peak = Math.max(peak, active);
@@ -423,7 +421,7 @@ test("per-job concurrency bounds simultaneous executions within the system's lim
       return input;
     },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [limited], concurrency: 4 });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { limited }, concurrency: 4 });
   t.after(() => jobs.close());
   assert.deepEqual(await Promise.all([1, 2, 3, 4, 5].map((n) => limited(n).result())), [1, 2, 3, 4, 5]);
   assert.equal(peak, 2);
@@ -433,10 +431,10 @@ test("a key derived from the input reuses the active job and frees the key on co
   const release = Promise.withResolvers();
   let runs = 0;
   const sync = defineJob({
-    name: "sync", deps: [], metadata: { key: (input) => `user:${input.userId}` },
+    deps: [], metadata: { key: (input) => `user:${input.userId}` },
     async handler(input) { runs++; await release.promise; return input.userId; },
   });
-  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: [sync] });
+  const jobs = createJobSystem({ backend: new MemoryBackend(), container: new Container(), jobs: { sync } });
   t.after(async () => { release.resolve(); await jobs.close(); });
   const first = await sync({ userId: 7 });
   const duplicate = await sync({ userId: 7 });
@@ -452,10 +450,75 @@ test("a key derived from the input reuses the active job and frees the key on co
 });
 
 test("invalid metadata is rejected when the job is defined", () => {
-  const bad = (metadata) => () => defineJob({ name: "bad", deps: [], metadata, handler() {} });
+  const bad = (metadata) => () => defineJob({ deps: [], metadata, handler() {} });
   assert.throws(bad({ retries: { attempts: 0 } }), /retries.attempts/);
   assert.throws(bad({ retries: { backoff: "sometimes" } }), /backoff.type/);
   assert.throws(bad({ timeout: -1 }), /timeout/);
   assert.throws(bad({ concurrency: 1.5 }), /concurrency/);
   assert.throws(bad({ key: "static" }), /key/);
+});
+
+
+test("registration keys supply delivery identity and hooks keep the snapshotted catalog name", async (t) => {
+  const messages = [];
+  const contexts = [];
+  class Backend extends MemoryBackend {
+    async submit(message) { messages.push(message); return super.submit(message); }
+  }
+  const localJob = defineJob({
+    deps: [], handler: (input) => input + 1,
+    beforeRun: (_input, context) => contexts.push(context.name),
+    onSuccess: (_output, context) => contexts.push(context.name),
+  });
+  const replacement = defineJob({ deps: [], handler: () => "wrong" });
+  const catalog = { sendEmail: localJob };
+  const jobs = createJobSystem({ container: new Container(), jobs: catalog, backend: new Backend() });
+  t.after(() => jobs.close());
+  catalog.sendEmail = replacement;
+  catalog.extra = replacement;
+  assert.equal(await localJob(4).result(), 5);
+  assert.deepEqual(messages.map((message) => message.name), ["sendEmail"]);
+  assert.deepEqual(contexts, ["sendEmail", "sendEmail"]);
+  await assert.rejects(replacement(null), /not attached/);
+});
+
+test("catalogs require nonempty string keys and reject arrays without attaching jobs", async () => {
+  const job = defineJob({ deps: [], handler() {} });
+  for (const catalog of [[job], null, { " ": job }, { [Symbol("job")]: job }]) {
+    assert.throws(() => createJobSystem({ container: new Container(), jobs: catalog, backend: new MemoryBackend() }), /keys/);
+    await assert.rejects(job(null), /not attached/);
+  }
+});
+
+test("deduplication is isolated by registration key even when name and key contain separators", async (t) => {
+  const release = Promise.withResolvers();
+  let firstCalls = 0;
+  let secondCalls = 0;
+  const first = defineJob({
+    deps: [], async handler() { firstCalls++; await release.promise; return 42; },
+    metadata: { key: () => "c" },
+  });
+  const second = defineJob({
+    deps: [], async handler() { secondCalls++; await release.promise; return "second"; },
+    metadata: { key: () => "b:c" },
+  });
+  const third = defineJob({
+    deps: [], async handler() { await release.promise; return "third"; },
+    metadata: { key: () => "c" },
+  });
+  const jobs = createJobSystem({
+    container: new Container(), jobs: { "a:b": first, a: second, third },
+    backend: new MemoryBackend(), concurrency: 3,
+  });
+  t.after(async () => { release.resolve(); await jobs.close(); });
+  const original = await first(null);
+  const duplicate = await first(null);
+  const other = await second(null);
+  const sameKey = await third(null);
+  assert.equal(original.id, duplicate.id);
+  assert.equal(new Set([original.id, other.id, sameKey.id]).size, 3);
+  release.resolve();
+  assert.deepEqual(await Promise.all([original.result(), duplicate.result(), other.result(), sameKey.result()]), [42, 42, "second", "third"]);
+  assert.equal(firstCalls, 1);
+  assert.equal(secondCalls, 1);
 });

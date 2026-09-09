@@ -8,7 +8,7 @@ import { createJobSystem, RedisBackend } from "core";
 
 const jobs = createJobSystem({
   container,
-  jobs: [updateMemory],
+  jobs: { updateMemory },
   concurrency: 4,
   backend: new RedisBackend({
     queue: "memory-jobs",
@@ -27,7 +27,7 @@ use compatible catalogs and codecs with their own dependency containers. The
 lower-level backend contract also supports separate producer and worker processes.
 
 Each job's `metadata.retries` becomes BullMQ `attempts` and `backoff` at submission,
-and `metadata.key` becomes a BullMQ deduplication id that is held while the job is
+and `metadata.key`, scoped by the registration key, becomes a BullMQ deduplication id that is held while the job is
 queued, delayed, or active. A retryable failure before the final attempt is thrown
 to BullMQ so it schedules the next delivery; the final outcome is retained like a
 successful output. Executor rejection is infrastructure failure and shares the same

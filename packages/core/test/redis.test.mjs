@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { Queue } from "bullmq";
-import { Container, createJobSystem, defineJob, RedisBackend } from "../dist/index.js";
+import { Container, createJobSystem, defineJob, JsonCodec, RedisBackend } from "../dist/index.js";
 
 const port = Number(process.env.JOB_SYSTEM_REDIS_PORT);
 const redis = { skip: !port, timeout: 20_000 };
@@ -66,7 +66,7 @@ test("separate producer and worker processes exchange retained results", redis, 
   const completed = await producer.message("completed");
   assert.notEqual(completed.producerPid, ready.workerPid);
   assert.notEqual(ready.workerPid, process.pid);
-  assert.deepEqual(JSON.parse(completed.outcome.output), { value: 42, workerPid: ready.workerPid });
+  assert.deepEqual(new JsonCodec().decode(completed.outcome.output), { value: 42, workerPid: ready.workerPid });
   assert.deepEqual(completed.late, completed.outcome);
   const workerExit = once(worker.child, "exit");
   worker.child.send("close");
@@ -178,7 +178,6 @@ test("job systems serialize inputs, inject worker services, and await lifecycle 
     add(amount) { this.total += amount; return this.total; }
   }
   const add = defineJob({
-    name: "counter.add",
     deps: [Counter],
     handler(input, counter, signal) {
       assert.equal(signal.aborted, false);
@@ -196,7 +195,7 @@ test("job systems serialize inputs, inject worker services, and await lifecycle 
     },
   });
   const jobs = createJobSystem({
-    container: new Container().register(Counter), jobs: [add], backend: env.backend(), concurrency: 2,
+    container: new Container().register(Counter), jobs: { add }, backend: env.backend(), concurrency: 2,
   });
   try {
     const input = { amount: 2, label: "submitted snapshot" };
@@ -215,6 +214,37 @@ test("job systems serialize inputs, inject worker services, and await lifecycle 
     await jobs.close();
     await assert.rejects(add({ amount: 1, label: "closed" }), /not attached/);
   } finally {
+    await jobs.close();
+  }
+});
+
+
+test("Redis deduplication shares work only within the same registered job", redis, async (t) => {
+  const env = fixture(t);
+  const release = Promise.withResolvers();
+  let firstCalls = 0;
+  let secondCalls = 0;
+  const first = defineJob({
+    deps: [], async handler() { firstCalls++; await release.promise; return 42; },
+    metadata: { key: () => "same-key" },
+  });
+  const second = defineJob({
+    deps: [], async handler() { secondCalls++; await release.promise; return "second"; },
+    metadata: { key: () => "same-key" },
+  });
+  const jobs = createJobSystem({ container: new Container(), jobs: { first, second }, backend: env.backend(), concurrency: 2 });
+  try {
+    const original = await first(null);
+    const duplicate = await first(null);
+    const other = await second(null);
+    assert.equal(original.id, duplicate.id);
+    assert.notEqual(original.id, other.id);
+    release.resolve();
+    assert.deepEqual(await Promise.all([original.result(), duplicate.result(), other.result()]), [42, 42, "second"]);
+    assert.equal(firstCalls, 1);
+    assert.equal(secondCalls, 1);
+  } finally {
+    release.resolve();
     await jobs.close();
   }
 });

@@ -3,7 +3,6 @@ import { defineJob } from "core";
 
 /** Never finishes on its own; the timeout aborts the signal and the attempt fails. */
 export const stall = defineJob({
-  name: "stall",
   deps: [],
 
   async handler(_input: { label: string }, signal) {

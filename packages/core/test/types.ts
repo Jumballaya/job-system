@@ -22,7 +22,6 @@ container.register(Required, { useFactory: () => ({ wrong: true }) });
 container.register(Counter, { useValue: new Counter(), useFactory: () => new Counter() });
 
 const add = defineJob({
-  name: "counter.add",
   deps: [Counter],
   async handler(input: { amount: number }, counter, signal) {
     const abortSignal: AbortSignal = signal;
@@ -37,7 +36,6 @@ const add = defineJob({
   },
 });
 const label = defineJob({
-  name: "label",
   deps: [],
   metadata: {
     retries: { attempts: 5, backoff: "fixed" },
@@ -48,22 +46,19 @@ const label = defineJob({
   handler: (input: string) => input.toUpperCase(),
 });
 defineJob({
-  name: "typed-key",
   deps: [],
   // @ts-expect-error The key derives from the declared input type.
   metadata: { key: (input: number) => String(input) },
   handler: (input: string) => input,
 });
 defineJob({
-  name: "unknown-field",
   deps: [],
   // @ts-expect-error Metadata has a fixed set of fields.
   metadata: { priority: 1 },
   handler: (input: string) => input,
 });
-const jobs = createJobSystem({ container, jobs: [add, label], backend: new MemoryBackend() });
+const jobs = createJobSystem({ container, jobs: { add, label }, backend: new MemoryBackend() });
 
-const name: "counter.add" = add.name;
 const handle: Promise<JobHandle<number>> = add({ amount: 1 });
 const count: Promise<number> = add({ amount: 1 }).result();
 const text: Promise<string> = label("hello").result();
@@ -75,9 +70,18 @@ const wrongOutput: Promise<string> = add({ amount: 1 }).result();
 jobs.run("counter.add", { amount: 1 });
 // @ts-expect-error Worker startup is internal.
 jobs.start();
-void [name, handle, count, text, wrongOutput];
+void [handle, count, text, wrongOutput];
 
 // @ts-expect-error Only definitions from defineJob form a catalog.
-createJobSystem({ container, jobs: [add, () => {}], backend: new MemoryBackend() });
+createJobSystem({ container, jobs: { add, invalid: () => {} }, backend: new MemoryBackend() });
 // @ts-expect-error A backend must be selected explicitly.
-createJobSystem({ container, jobs: [add] });
+createJobSystem({ container, jobs: { add } });
+
+// @ts-expect-error Catalog keys provide identity; array registration is unsupported.
+createJobSystem({ container, jobs: [add], backend: new MemoryBackend() });
+defineJob({
+  // @ts-expect-error Job identity belongs to registration, not the definition.
+  name: "extra-name",
+  deps: [],
+  handler: (input: string) => input,
+});

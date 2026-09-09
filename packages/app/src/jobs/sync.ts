@@ -3,7 +3,6 @@ import { defineJob } from "core";
 
 /** One active sync per user, and only one sync running at a time in this process. */
 export const syncUser = defineJob({
-  name: "user.sync",
   deps: [],
 
   async handler(input: { userId: number }, signal) {

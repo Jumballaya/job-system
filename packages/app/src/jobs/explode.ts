@@ -9,7 +9,6 @@ export class QuotaError extends NonRetryableError {
 }
 
 export const explode = defineJob({
-  name: "explode",
   deps: [],
 
   async handler(input: { quota: number }): Promise<never> {
