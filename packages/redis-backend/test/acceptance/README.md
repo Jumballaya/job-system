@@ -11,8 +11,8 @@ in `packages/temporal-backend/test`.
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance
 
 # Build first, then run one contract while implementing it.
-pnpm --filter core build
-JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server node --test --test-name-pattern='^1 ' packages/core/test/acceptance/v1.test.mjs
+pnpm --filter redis-backend... build
+JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server node --test --test-name-pattern='^1 ' packages/redis-backend/test/acceptance/v1.test.mjs
 ```
 
 Tests 1–5 each own a Redis process with AOF, a temporary directory, and separate

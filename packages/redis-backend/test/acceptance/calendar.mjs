@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mock } from "node:test";
-import { createJobSystem, defineJob, MemoryBackend } from "../../dist/index.js";
+import { createJobSystem, defineJob, MemoryBackend } from "core";
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 const cases = [

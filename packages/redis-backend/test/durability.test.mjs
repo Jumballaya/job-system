@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Queue } from "bullmq";
-import { Container, createJobSystem, defineJob, IdempotencyConflictError, JsonCodec, MemoryBackend, RedisBackend } from "../dist/index.js";
+import { Container, createJobSystem, defineJob, IdempotencyConflictError, JsonCodec, MemoryBackend } from "core";
+import { RedisBackend } from "redis-backend";
 import { Ledger } from "./fixtures/ledger.mjs";
 
 const port = Number(process.env.JOB_SYSTEM_REDIS_PORT);

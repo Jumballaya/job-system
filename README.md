@@ -1,8 +1,9 @@
 # Job system
 
 A lightweight TypeScript library for class-based dependency injection and typed jobs
-with swappable backends. This workspace uses Node.js 24 and pnpm 11.18.0. Core includes memory and Redis strategies;
-the Redis strategy uses BullMQ. Temporal is available in the optional `temporal-backend` package.
+with swappable backends. This workspace uses Node.js 24 and pnpm 11.18.0.
+Core includes the memory strategy. Redis/BullMQ, Postgres, and Temporal each live in
+their own optional backend package; each backend owns execution, schedules, and results.
 
 ```sh
 pnpm install
@@ -10,8 +11,9 @@ pnpm test
 pnpm start
 ```
 
-`pnpm build` compiles core, app, and the Temporal adapter. `pnpm test` also runs Temporal
-integration tests, which start isolated servers and download their executables on first use.
+`pnpm build` compiles core, app, and all backend packages. `pnpm test` also runs Postgres
+and Temporal integration tests using isolated servers. Embedded Postgres is a test-only
+dependency; Temporal downloads its server executables on first use.
 `pnpm start` runs the app demo against Redis
 on `127.0.0.1:6379` (`docker compose up -d` starts one); see "Assemble the system"
 for the scenarios it walks through and the environment switches.
@@ -203,16 +205,30 @@ dependencies remain cached. The container does not automatically dispose resourc
 
 ## Choose a backend
 
+| Package | Execution and storage |
+| --- | --- |
+| `core` | In-process memory; no external service. |
+| `postgres-backend` | Postgres queue, leases, schedules, and long-term results; borrows an existing pool. |
+| `redis-backend` | Redis/BullMQ; owns its Redis connections. |
+| `temporal-backend` | Temporal workflows/activities; borrows existing connections. |
+
+For Postgres, use `PostgresBackend` from `postgres-backend`, run `await backend.migrate()`
+during application setup, then pass it to `createJobSystem`. It can share Adapt v2's
+existing database through `database.$client`; migrations belong to the backend package.
+See the [Postgres guide](packages/postgres-backend/README.md) for setup, retention, and recovery.
+There is no separate history-store interface: the selected backend owns its full lifecycle.
+
+
 For an existing Temporal deployment, use `TemporalBackend` from the optional
 [`temporal-backend` package](packages/temporal-backend/README.md). It accepts your
 Temporal client and worker connection; job definitions and calls stay the same.
 
 A backend is required. Import `MemoryBackend` from `core` and pass
 `backend: new MemoryBackend()` for in-process execution. To use Redis, import `RedisBackend`
-from `core` and pass it instead; job definitions stay unchanged:
+from `redis-backend` and pass it instead; job definitions stay unchanged:
 
 ```ts
-import { RedisBackend } from "core";
+import { RedisBackend } from "redis-backend";
 
 const jobs = createJobSystem({
   container,
@@ -579,7 +595,7 @@ independent. Providers supporting recurrence implement `JobSchedules.upsert`,
 or cron plus timezone). The provider owns durable registration identity and
 occurrence advancement. Providers without this capability reject recurring calls.
 
-Memory, Redis/BullMQ, and Temporal are implemented. An SQS or RabbitMQ adapter may need an
+Memory, Redis/BullMQ, Postgres, and Temporal are implemented. An SQS or RabbitMQ adapter may need an
 additional result store; a queue alone is not the complete backend. The core does
 not assume a universal visibility lease, transaction protocol or pub/sub mechanism.
 
@@ -591,15 +607,16 @@ the Redis adapter's owned connections and draining lifecycle.
 ## Verification
 
 `pnpm test` builds all packages, runs core behavior and emitted-type checks, and runs
-Temporal integration tests. Temporal tests start their own local servers, need permission
-to open local sockets, and download server executables on first use; they do not skip.
+Postgres and Temporal integration tests. Both start local servers and need permission
+to open local sockets. Temporal downloads server executables on first use; neither suite skips.
+Postgres can instead use a dedicated database through `JOB_SYSTEM_POSTGRES_URL`.
 To run only core after building, use `pnpm --filter core test`.
 
 Most Redis integration tests skip unless a dedicated Redis port is supplied.
 The Redis server-crash test separately requires the server executable:
 
 ```sh
-JOB_SYSTEM_REDIS_PORT=16379 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm --filter core test
+JOB_SYSTEM_REDIS_PORT=16379 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm --filter redis-backend test
 ```
 
 Use an isolated test Redis. Tests use unique queue names and delete only their own
@@ -607,8 +624,8 @@ queues. They include separate producer/worker processes, late result retrieval,
 terminal failures, cancellation and shutdown. No tests or infrastructure setup
 are added to the tiny app's source directory.
 
-The six [V1 replacement acceptance contracts](packages/core/test/acceptance/README.md)
-run separately; all six pass:
+The six [V1 replacement acceptance contracts](packages/redis-backend/test/acceptance/README.md)
+run separately:
 
 ```sh
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance

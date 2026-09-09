@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createJobSystem, defineJob, JsonCodec } from "../../dist/index.js";
+import { createJobSystem, defineJob, JsonCodec } from "core";
 import { eventually, pause } from "./helpers.mjs";
 
 // Provider-level failures bypass the handler; public inspection must still describe their retained records.

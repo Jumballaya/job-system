@@ -3,7 +3,8 @@ import { fork } from "node:child_process";
 import { once } from "node:events";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createJobSystem, defineJob, MemoryBackend, RedisBackend } from "../../dist/index.js";
+import { createJobSystem, defineJob, MemoryBackend } from "core";
+import { RedisBackend } from "redis-backend";
 import { deadline, eventually, kill, pause, Peer, redis, scope } from "./helpers.mjs";
 import { inspectBackend } from "./inspection.mjs";
 

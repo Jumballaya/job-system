@@ -1,0 +1,27 @@
+{
+  "name": "redis-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "test:acceptance": "node --test test/acceptance/v1.test.mjs",
+    "prepack": "pnpm run build"
+  },
+  "dependencies": {
+    "core": "workspace:*",
+    "bullmq": "^5.81.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3"
+  }
+}

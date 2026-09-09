@@ -4,7 +4,8 @@ import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { Queue } from "bullmq";
-import { Container, createJobSystem, defineJob, JsonCodec, RedisBackend } from "../dist/index.js";
+import { Container, createJobSystem, defineJob, JsonCodec } from "core";
+import { RedisBackend } from "redis-backend";
 
 const port = Number(process.env.JOB_SYSTEM_REDIS_PORT);
 const redis = { skip: !port, timeout: 20_000 };

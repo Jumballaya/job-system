@@ -1,5 +1,9 @@
 # Job backend design comparison
 
+Current packaging keeps the complete backend boundary below: memory lives in core;
+Redis, Temporal, and Postgres have independent packages. The Postgres package owns
+its schema, migrations, execution, schedules, and retained history without a separate store port.
+
 This comparison applies the complete `coding-style` skill to four messaging
 boundaries. Each design was revised to address its own complexity costs before
 selection. The selected boundary is A, with explicit worker readiness and
@@ -174,8 +178,8 @@ The implementation separates concerns by knowledge:
   hook behavior, and dependency scope creation.
 - The memory backend provides process-local delivery and results using the same
   backend contract. It is not durable storage.
-- [`RedisBackend`](../../packages/core/src/strategies/redis-backend.ts) implements
-  the contract using BullMQ. Both strategies live in core; Redis configuration
+- [`RedisBackend`](../../packages/redis-backend/src/redis-backend.ts) implements
+  the contract using BullMQ in its own optional package; Redis configuration
   and connections remain encapsulated in its strategy.
 - Application code calls `run(name, input)` and closes owned resources when done.
   The first valid run opens one worker; concurrent runs share its startup. Core

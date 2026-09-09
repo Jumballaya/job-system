@@ -1,4 +1,5 @@
-import { Container, createJobSystem, defineJob, RedisBackend } from "../dist/index.js";
+import { Container, createJobSystem, defineJob } from "core";
+import { RedisBackend } from "redis-backend";
 
 const [role, queue] = process.argv.slice(2);
 const backend = new RedisBackend({

@@ -1,4 +1,5 @@
-import { Container, createJobSystem, defineJob, RedisBackend } from "../../dist/index.js";
+import { Container, createJobSystem, defineJob } from "core";
+import { RedisBackend } from "redis-backend";
 import { Ledger } from "./ledger.mjs";
 
 const [queue, filename, mode] = process.argv.slice(2);

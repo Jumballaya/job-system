@@ -162,3 +162,5 @@ export function failure(error: unknown): JobFailure {
   if (error instanceof Error) return { name: error.name, message: error.message, ...(error.stack ? { stack: error.stack } : {}) };
   return { name: "Error", message: typeof error === "string" ? error : "Job failed with a non-Error value" };
 }
+
+export { ConcurrencyLimits } from "./concurrency.js";

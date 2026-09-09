@@ -1,4 +1,5 @@
-import { MemoryBackend, RedisBackend } from "core";
+import { MemoryBackend } from "core";
+import { RedisBackend } from "redis-backend";
 import type { JobBackend } from "core";
 
 /** JOB_BACKEND=memory switches to in-process execution; Redis is the default. */

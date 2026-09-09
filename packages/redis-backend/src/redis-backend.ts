@@ -1,10 +1,10 @@
 import { DelayedError, Job, Queue, Worker } from "bullmq";
 import type { JobJsonRaw, RedisOptions } from "bullmq";
-import { assertSameSubmission, JobInterruptedError, prepareSubmission, ResultUnavailableError } from "../backend.js";
-import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobRecord, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
-import { occurrence, scheduleId, validateRule } from "../scheduling.js";
-import type { JobSchedules, ScheduleRule } from "../scheduling.js";
-import { ConcurrencyLimits } from "../concurrency.js";
+import { assertSameSubmission, JobInterruptedError, prepareSubmission, ResultUnavailableError } from "core/backend";
+import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobRecord, JobWorker, WaitOptions, WorkerOptions } from "core/backend";
+import { occurrence, scheduleId, validateRule } from "core/scheduling";
+import type { JobSchedules, ScheduleRule } from "core/scheduling";
+import { ConcurrencyLimits } from "core/backend";
 
 const redisRequestTimeoutMs = 5_000;
 const resultPollIntervalMs = 50;

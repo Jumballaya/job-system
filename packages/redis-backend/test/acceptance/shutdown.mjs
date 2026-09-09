@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createJobSystem, defineJob, JsonCodec, MemoryBackend, ShutdownTimeoutError } from "../../dist/index.js";
+import { createJobSystem, defineJob, JsonCodec, MemoryBackend, ShutdownTimeoutError } from "core";
 
 const policy = { timeout: Infinity, retries: { attempts: 1 } };
 

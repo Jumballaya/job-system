@@ -7,6 +7,4 @@ export type { JobBackend, JobMessage, JobOutcome, JobRecord, JobFailure, JobExec
 export { MemoryBackend } from "./strategies/memory-backend.js";
 export { JsonCodec } from "./codec.js";
 export type { JobCodec } from "./codec.js";
-export { RedisBackend } from "./strategies/redis-backend.js";
-export type { RedisBackendOptions } from "./strategies/redis-backend.js";
 export type { Timing, Delay, Duration, Recurrence, ScheduleHandle, ScheduleRule, JobSchedules } from "./scheduling.js";

@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Queue } from "bullmq";
-import { Container, createJobSystem, defineJob, IdempotencyConflictError, MemoryBackend, RedisBackend } from "../dist/index.js";
+import { Container, createJobSystem, defineJob, IdempotencyConflictError, MemoryBackend } from "core";
+import { RedisBackend } from "redis-backend";
 
 const port = Number(process.env.JOB_SYSTEM_REDIS_PORT);
 const once = { attempts: 1, backoff: { type: "fixed", delay: 0 } };

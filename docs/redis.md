@@ -4,7 +4,8 @@
 connections; pass connection settings, not an existing Redis client.
 
 ```ts
-import { createJobSystem, RedisBackend } from "core";
+import { createJobSystem } from "core";
+import { RedisBackend } from "redis-backend";
 
 const jobs = createJobSystem({
   container,
@@ -121,8 +122,8 @@ was offline resumes the pending occurrence, then continues future scheduling.
 Build and test against an isolated Redis server:
 
 ```sh
-pnpm --filter core build
-JOB_SYSTEM_REDIS_PORT=16379 pnpm --filter core test
+pnpm --filter redis-backend... build
+JOB_SYSTEM_REDIS_PORT=16379 pnpm --filter redis-backend test
 ```
 
 Integration tests create unique queues and remove only their own queues. The suite
@@ -135,7 +136,7 @@ usually about a minute. Redis integration tests skip without the port variable.
 To also test a Redis process crash and recovery from AOF, supply a local binary:
 
 ```sh
-JOB_SYSTEM_REDIS_PORT=16379 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm --filter core test
+JOB_SYSTEM_REDIS_PORT=16379 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm --filter redis-backend test
 ```
 
 That test owns a separate temporary Redis process, port, and data directory. It

@@ -1,4 +1,5 @@
-import { createJobSystem, defineJob, RedisBackend } from "../../dist/index.js";
+import { createJobSystem, defineJob } from "core";
+import { RedisBackend } from "redis-backend";
 
 const settings = JSON.parse(process.argv[2]);
 const gates = new Map();

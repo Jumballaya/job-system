@@ -63,8 +63,8 @@ existing receipt after checking the payload, or apply the business change and
 insert its receipt/result. Both must commit or roll back together. A separate
 "processed" flag written before or after the effect leaves a crash window.
 
-The executable [SQLite ledger fixture](../packages/core/test/fixtures/ledger.mjs)
-demonstrates this transaction. The [crash test](../packages/core/test/durability.test.mjs)
+The executable [SQLite ledger fixture](../packages/redis-backend/test/fixtures/ledger.mjs)
+demonstrates this transaction. The [crash test](../packages/redis-backend/test/durability.test.mjs)
 kills a worker after the balance and receipt commit but before queue acknowledgement.
 A different worker receives the job again and returns the receipt: two deliveries,
 one credit. Another test drops an HTTP response after commit and verifies the same
