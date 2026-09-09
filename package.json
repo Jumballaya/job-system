@@ -6,6 +6,7 @@
   "scripts": {
     "build": "pnpm -r run build",
     "test": "pnpm run build && pnpm -r --if-present run test",
+    "test:acceptance": "pnpm --filter core build && pnpm --filter core test:acceptance",
     "start": "pnpm run build && pnpm --filter app start",
     "worker": "pnpm run build && pnpm --filter app worker"
   },

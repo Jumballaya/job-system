@@ -428,4 +428,14 @@ queues. They include separate producer/worker processes, late result retrieval,
 terminal failures, cancellation and shutdown. No tests or infrastructure setup
 are added to the tiny app's source directory.
 
+The six [V1 replacement acceptance contracts](packages/core/test/acceptance/README.md)
+run separately and intentionally fail until their features are implemented:
+
+```sh
+JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance
+```
+
+This suite owns its Redis and worker processes. Each numbered gap has one top-level
+test; the acceptance README documents its scenario and draft interface assumptions.
+
 The earlier DI review in `docs/reviews` is historical and predates this API.
