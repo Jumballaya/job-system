@@ -155,7 +155,7 @@ test("3 — saturated work cannot starve another job type or evade its own concu
   }
 });
 
-test("4 — shutdown is bounded, signals cleanup, and recovers unfinished work without premature overlap or spent attempts", { timeout: 100_000 }, async (t) => {
+test("4 — shutdown is bounded, signals cleanup, and recovers unfinished work without premature overlap or spent attempts", { timeout: 180_000 }, async (t) => {
   const cleanup = scope(t);
   const server = await redis(cleanup);
   const old = new Peer(cleanup, { ...server, concurrency: 2, shutdownTimeoutMs: 100 });
@@ -165,19 +165,25 @@ test("4 — shutdown is bounded, signals cleanup, and recovers unfinished work w
   await old.wait((event) => event.event === "started" && event.id === cooperative.id, "Cooperative handler never started");
   await old.wait((event) => event.event === "started" && event.id === stubborn.id, "Stubborn handler never started");
   const queued = await producer.call("record", { label: "queued" });
+  const closingAt = Date.now();
   await assert.rejects(old.request("close", {}, 1_000), { name: "ShutdownTimeoutError" });
+  assert.ok(Date.now() - closingAt >= 100, "shutdown skipped its configured grace period");
   await old.wait((event) => event.event === "aborted" && event.input.label === "cooperative", "Shutdown never aborted the cooperative request");
   await assert.rejects(old.call("record", { label: "late" }), /closed|not attached/);
 
   const replacement = new Peer(cleanup, { ...server, hold: false });
   await producer.result(queued.id);
-  await pause(200);
+  await pause(65_000); // Cross two real BullMQ lease/stall intervals while the timed-out worker stays alive.
   assert.equal(replacement.events.filter((event) => event.event === "started" && event.id === stubborn.id).length, 0,
     "deadline expiry allowed overlapping execution of a live handler");
   assert.equal(replacement.events.filter((event) => event.event === "started" && event.id === cooperative.id).length, 0,
     "retry began before cooperative cleanup settled");
   await old.request("release", { label: "cleanup" });
   await old.wait((event) => event.event === "cleanup", "Cooperative cleanup could not finish after shutdown deadline");
+  assert.deepEqual(await producer.result(cooperative.id), { label: "cooperative", value: 42 },
+    "settled cleanup did not hand work back while another old handler was still alive");
+  assert.equal(old.events.filter((event) => event.event === "attemptFailed").length, 0,
+    "deployment cancellation was reported as a business failure");
   await kill(old.child);
 
   assert.deepEqual(await producer.result(stubborn.id, 90_000), { label: "stubborn", value: 42 });
@@ -188,6 +194,11 @@ test("4 — shutdown is bounded, signals cleanup, and recovers unfinished work w
     assert.equal(replacement.effects(label)[0].attempt, 1, "deployment shutdown spent a business retry attempt");
   }
   await replacement.exit();
+  const probe = fork(fileURLToPath(new URL("./shutdown.mjs", import.meta.url)), { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+  cleanup(() => kill(probe));
+  let errors = "";
+  probe.stderr.on("data", (chunk) => { errors += chunk; });
+  assert.equal((await deadline(once(probe, "exit"), 5_000, "Shutdown cleanup checks hung"))[0], 0, errors);
 });
 
 test("5 — a fresh process can inspect queued, running, retried, and retained failed executions by ID", { timeout: 20_000 }, async (t) => {

@@ -1,4 +1,4 @@
-import { assertSameSubmission, backoffDelay, prepareSubmission, ResultUnavailableError } from "../backend.js";
+import { assertSameSubmission, backoffDelay, JobInterruptedError, prepareSubmission, ResultUnavailableError } from "../backend.js";
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 import { nextRun, occurrence, scheduleId, validateRule } from "../scheduling.js";
 import type { JobSchedules, ScheduleRule } from "../scheduling.js";
@@ -242,9 +242,16 @@ export class MemoryBackend implements JobBackend {
         this.complete(entry, { outcome: structuredClone(outcome) });
       }
     } catch (error) {
-      this.complete(entry, { error });
-      consumer.stopping = true;
-      consumer.failure ??= { error };
+      if (error instanceof JobInterruptedError) {
+        entry.attempt--;
+        entry.availableAt = Date.now();
+        this.queue.push(entry);
+        consumer.stopping = true;
+      } else {
+        this.complete(entry, { error });
+        consumer.stopping = true;
+        consumer.failure ??= { error };
+      }
     } finally {
       release();
       consumer.active--;

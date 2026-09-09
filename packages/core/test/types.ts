@@ -109,7 +109,7 @@ const wrongOutput: Promise<string> = add({ amount: 1 }).result();
 jobs.run("counter.add", { amount: 1 });
 // @ts-expect-error Initialization starts the worker; there is no separate start step.
 jobs.start();
-const producer = createJobSystem({ jobs: { add }, backend: new MemoryBackend(), worker: false });
+const producer = createJobSystem({ jobs: { add }, backend: new MemoryBackend(), worker: false, shutdownTimeoutMs: 5_000 });
 // @ts-expect-error Worker selection must be boolean.
 createJobSystem({ jobs: { add }, backend: new MemoryBackend(), worker: "off" });
 void producer;

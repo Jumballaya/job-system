@@ -50,7 +50,7 @@ export interface JobWorker {
   close(): Promise<void>;
 }
 
-/** `attempt` starts at 1; waiting for worker capacity never spends an attempt. */
+/** `attempt` starts at 1. JobInterruptedError returns settled work to the queue without spending an attempt. */
 export type JobExecutor = (message: JobMessage, signal: AbortSignal, attempt: number) => Promise<JobOutcome>;
 
 /** Own delivery and retained outcomes. Recover infrastructure failures without promising exactly-once effects. */
@@ -122,5 +122,21 @@ export class JobExecutionError extends Error {
   constructor(public readonly jobId: string, public readonly failure: JobFailure) {
     super(failure.message);
     this.name = "JobExecutionError";
+  }
+}
+
+/** Executor control flow: work and cleanup have settled; preserve identity and attempts for another worker. */
+export class JobInterruptedError extends Error {
+  constructor() {
+    super("Worker stopped before execution completed");
+    this.name = "JobInterruptedError";
+  }
+}
+
+/** Close exceeded its grace period; cancellation was requested, but live work may still own resources. */
+export class ShutdownTimeoutError extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super(`Job system shutdown exceeded ${timeoutMs} ms; unfinished work is still draining`);
+    this.name = "ShutdownTimeoutError";
   }
 }

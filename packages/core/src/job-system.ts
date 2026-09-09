@@ -1,6 +1,6 @@
 import { Container } from "./dep-inject.js";
 import type { Constructor } from "./dep-inject.js";
-import { JobExecutionError, NonRetryableError, prepareSubmission } from "./backend.js";
+import { JobExecutionError, JobInterruptedError, NonRetryableError, prepareSubmission, ShutdownTimeoutError } from "./backend.js";
 import type { JobBackend, JobFailure, JobMessage, JobOutcome, JobPolicy, JobWorker, WaitOptions } from "./backend.js";
 import { JsonCodec } from "./codec.js";
 import type { JobCodec } from "./codec.js";
@@ -15,7 +15,7 @@ type Instances<Deps extends readonly Constructor[]> = {
 export interface JobContext {
   readonly jobId: string;
   readonly name: string;
-  /** Aborted by timeout or backend-reported execution loss; graceful shutdown drains active work. */
+  /** Aborted by job timeout, execution loss, or expiry of the shutdown grace period. */
   readonly signal: AbortSignal;
   /** Starts at 1 and counts execution attempts, including retries; capacity waiting doesn't count. */
   readonly attempt: number;
@@ -161,14 +161,20 @@ export class JobSystem {
   private readonly codec: JobCodec;
   private readonly concurrency: number;
   private readonly shutdown = new AbortController();
+  private readonly executionShutdown = new AbortController();
+  private readonly shutdownTimeoutMs: number;
   private worker?: Promise<JobWorker>;
   private closing?: Promise<void>;
 
-  constructor(private readonly container: Container, jobs: Readonly<Record<string, AnyJob>>, options: { backend: JobBackend; codec?: JobCodec; concurrency?: number; worker?: boolean }) {
+  constructor(private readonly container: Container, jobs: Readonly<Record<string, AnyJob>>, options: { backend: JobBackend; codec?: JobCodec; concurrency?: number; worker?: boolean; shutdownTimeoutMs?: number }) {
     if (!options?.backend) throw new Error("A job backend is required");
     this.backend = options.backend;
     this.codec = options.codec ?? new JsonCodec();
     this.concurrency = options.concurrency ?? 1;
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(this.shutdownTimeoutMs) || this.shutdownTimeoutMs < 0 || this.shutdownTimeoutMs > 2_147_483_647) {
+      throw new Error("shutdownTimeoutMs must be an integer between 0 and 2147483647");
+    }
     if (options.worker !== undefined && typeof options.worker !== "boolean") throw new Error("worker must be a boolean");
     if (!Number.isSafeInteger(this.concurrency) || this.concurrency < 1) throw new Error("concurrency must be a positive safe integer");
     if (!jobs || typeof jobs !== "object" || Array.isArray(jobs) ||
@@ -250,7 +256,8 @@ export class JobSystem {
   }
 
   public close(): Promise<void> {
-    this.closing ??= Promise.resolve().then(async () => {
+    if (this.closing) return this.closing;
+    const draining = Promise.resolve().then(async () => {
       const errors: unknown[] = [];
       try { await (await this.worker)?.close(); }
       catch (error) { errors.push(error); }
@@ -258,6 +265,18 @@ export class JobSystem {
       catch (error) { errors.push(error); }
       if (errors.length === 1) throw errors[0];
       if (errors.length > 1) throw new AggregateError(errors, "Worker and backend shutdown both failed");
+    });
+    this.closing = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const error = new ShutdownTimeoutError(this.shutdownTimeoutMs);
+        this.executionShutdown.abort(error);
+        reject(error);
+      }, this.shutdownTimeoutMs);
+      // Drain in the background after expiry; never release a lease while handler cleanup is still running.
+      void draining.then(
+        () => { clearTimeout(timer); resolve(); },
+        (error: unknown) => { clearTimeout(timer); reject(error); },
+      );
     });
     this.shutdown.abort(new Error("Job system is closed"));
     for (const { job } of this.catalog.values()) {
@@ -297,10 +316,12 @@ export class JobSystem {
   }
 
   private async execute(message: JobMessage, workerSignal: AbortSignal, attempt: number): Promise<JobOutcome> {
+    if (this.closing) throw new JobInterruptedError();
     const entry = this.catalog.get(message.name);
     if (!entry) return { status: "failed", error: failure(new Error(`Unknown job: ${message.name}`)), retryable: false };
     const { metadata } = entry;
     const job = entry.job.definition;
+    workerSignal = AbortSignal.any([workerSignal, this.executionShutdown.signal]);
     const signal = Number.isFinite(metadata.timeout)
       ? AbortSignal.any([workerSignal, AbortSignal.timeout(metadata.timeout)])
       : workerSignal;
@@ -323,6 +344,9 @@ export class JobSystem {
       output = await job.handler(input, ...dependencies, signal);
       signal.throwIfAborted();
     } catch (thrown) {
+      if (this.executionShutdown.signal.aborted && signal.reason === this.executionShutdown.signal.reason) {
+        throw new JobInterruptedError();
+      }
       // An aborted signal is the true cause; handlers surface it through library-specific errors.
       const error = signal.aborted ? signal.reason : thrown;
       const retryable = !(error instanceof NonRetryableError);
@@ -356,6 +380,8 @@ export function createJobSystem(options: {
   backend: JobBackend;
   codec?: JobCodec;
   concurrency?: number;
+  /** Grace period for close, including startup and resource cleanup; defaults to 30 seconds. */
+  shutdownTimeoutMs?: number;
   /** False submits to remote workers without starting a local worker or resolving dependencies. */
   worker?: boolean;
 }): JobSystem {

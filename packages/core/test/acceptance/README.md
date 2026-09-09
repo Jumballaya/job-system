@@ -1,7 +1,7 @@
 # V1 replacement acceptance contracts
 
-Exactly six top-level tests, numbered to match the agreed gaps. Tests 1–3 pass;
-4–6 remain intentionally red until implemented. They are separate from the existing regression
+Exactly six top-level tests, numbered to match the agreed gaps. Tests 1–4 pass;
+5–6 remain intentionally red until implemented. They are separate from the existing regression
 suite; no tests use `skip`, `todo`, unconditional failure, or feature-detection fallbacks.
 Passing establishes these scenarios, not proof against every possible failure.
 
@@ -29,7 +29,7 @@ at the public backend boundary. Process cleanup runs even when an assertion fail
 
 ## Interfaces used by the tests
 
-Timing and schedule handles are implemented. Shutdown deadlines, inspection,
+Timing, schedule handles, and shutdown deadlines are implemented. Inspection,
 failure retention, and worker error reporting below remain draft interfaces for
 future implementation. Refine those spellings while retaining the behavior above.
 
@@ -52,4 +52,7 @@ future implementation. Refine those spellings while retaining the behavior above
 
 The calendar helper is part of test 1, not another top-level test. Its clock is
 isolated in a child process; Redis scenarios use actual time and process lifetimes.
-Test 4 may take about a minute once implemented because it exercises real lease recovery.
+Test 4 holds the timed-out worker alive for 65 seconds to verify lease renewal,
+then exercises real crash recovery. It also checks immediate handoff after settled
+cleanup and runs a child probe for handler cleanup, success hooks, and late startup.
+Allow roughly two minutes for this contract.

@@ -290,10 +290,24 @@ The demo uses the same catalog in both processes. A single worker makes its
 process-local counter and retry examples predictable. `JOB_BACKEND=memory` remains
 available for the combined demo; memory does not share work across processes.
 
-`jobs.close()` stops intake, drains active work, rejects local result waits, and
-releases backend resources. Closing is idempotent and prevents new runs. It cannot
-retract work already accepted remotely, and draining can wait indefinitely for a
-handler that never finishes. Closing during startup waits for and closes the worker.
+`jobs.close()` stops intake and local result waits, then lets active work drain.
+Configure `shutdownTimeoutMs` at initialization; the default grace period is 30
+seconds, including startup and resource cleanup. If it expires, `close()` rejects
+with `ShutdownTimeoutError` and requests cancellation through execution signals.
+Repeated calls return the same close promise. Timing bounds require a responsive
+JavaScript event loop.
+
+Cleanup continues after the deadline. Live handlers retain their worker capacity
+and execution leases; connections close once those handlers and their cleanup
+settle. Interrupted handlers return to the queue with their original IDs and
+remaining attempts, without invoking the business-error hook. A success hook that
+outlives the deadline produces a terminal failure instead of repeating its handler.
+Closing during startup still closes the worker if it arrives after the deadline.
+
+A timeout does not forcibly stop JavaScript or end the process. The app's shutdown
+path decides when to terminate a process that cannot finish; Redis then recovers
+unfinished work through its lease protocol. Memory has no recovery after backend
+close or process exit. Accepted remote work remains queued for other workers.
 
 For jobs without `idempotencyKey`, the memory backend retains results for 60 seconds and at most 1,000 completed jobs;
 configure its age using `new MemoryBackend({ resultTTLms: ... })`. Redis retains
@@ -384,8 +398,8 @@ for per-job capacity stays queued, consumes no retry, and starts no execution
 deadline. Active hooks and handlers must cooperate with cancellation, for
 example by passing the signal to `fetch`. Retries wait for the previous handler
 and its cleanup to settle; a handler ignoring its signal can continue producing
-effects after the deadline. Graceful shutdown drains that work rather than
-aborting it. A success hook completing after the deadline produces a terminal
+effects after the deadline. Shutdown allows a grace period, then requests cancellation
+while continuing to wait for safe cleanup in the background. A success hook completing after the deadline produces a terminal
 failure, without repeating the handler's effects.
 
 ## Execution outcomes and hooks
@@ -451,7 +465,10 @@ and retain idempotent records and terminal outcomes without ordinary result evic
 number. A failed outcome marked `retryable` before the final attempt is redelivered
 after `backoffDelay(policy, attempt)`, exported from `core`; any other outcome is
 retained. `JobWorker.done` exposes later terminal processing failure; `close`
-drains active callbacks. A callback rejection is an infrastructure failure, with
+drains active callbacks and keeps their leases until they settle. `JobInterruptedError`
+is executor control flow: stop this worker and return the settled execution to the
+queue with its ID, deduplication reservation, and attempt budget intact. Other
+callback rejections are infrastructure failures, with
 recovery documented by the adapter. Unknown/expired IDs reject rather than waiting
 forever.
 
@@ -494,8 +511,8 @@ terminal failures, cancellation and shutdown. No tests or infrastructure setup
 are added to the tiny app's source directory.
 
 The six [V1 replacement acceptance contracts](packages/core/test/acceptance/README.md)
-run separately; #1 (timing and schedules), #2 (successor delivery), and #3 (workload
-isolation) pass. #4–#6 intentionally remain failing until implemented:
+run separately; #1 (timing and schedules), #2 (successor delivery), #3 (workload
+isolation), and #4 (bounded shutdown) pass. #5–#6 intentionally remain failing until implemented:
 
 ```sh
 JOB_SYSTEM_REDIS_SERVER=/path/to/redis-server pnpm test:acceptance

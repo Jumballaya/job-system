@@ -1,6 +1,6 @@
 import { DelayedError, Queue, Worker } from "bullmq";
 import type { Job, RedisOptions } from "bullmq";
-import { assertSameSubmission, prepareSubmission, ResultUnavailableError } from "../backend.js";
+import { assertSameSubmission, JobInterruptedError, prepareSubmission, ResultUnavailableError } from "../backend.js";
 import type { JobBackend, JobExecutor, JobMessage, JobOutcome, JobWorker, WaitOptions, WorkerOptions } from "../backend.js";
 import { occurrence, scheduleId, validateRule } from "../scheduling.js";
 import type { JobSchedules, ScheduleRule } from "../scheduling.js";
@@ -240,6 +240,12 @@ export class RedisBackend implements JobBackend {
           throw new Error(outcome.error.message);
         }
         return outcome;
+      } catch (error) {
+        if (!(error instanceof JobInterruptedError)) throw error;
+        // The executor has finished cleanup. Hand off with the same ID and attempt budget.
+        await worker.pause(true);
+        await job.moveToDelayed(Date.now(), token);
+        throw new DelayedError();
       } finally { release(); }
     }, {
       connection: { ...this.connection, maxRetriesPerRequest: null },

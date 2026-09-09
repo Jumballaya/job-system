@@ -73,10 +73,19 @@ BullMQ cleanup can erase the retained records. Deleting the queue or losing its
 Redis data also loses queue-side idempotency; retain database/provider receipts.
 
 Aborting a result wait affects only that wait. Accepted jobs continue running.
-Closing drains this backend's workers, rejects its waits, and closes its owned
-connections. Other processes and accepted queued jobs are unaffected. Redis
-requests and worker startup have a five-second bound; active handlers must settle
-for graceful worker shutdown to finish.
+The job system bounds `jobs.close()` using `shutdownTimeoutMs` (30 seconds by
+default). It stops intake and allows a grace period; expiry requests execution
+cancellation and rejects with `ShutdownTimeoutError`. The underlying worker keeps
+renewing leases while live handlers or cleanup remain. It never force-closes their
+connections merely because the caller's deadline expired.
+
+Once interrupted cleanup settles, the adapter returns that execution to Redis
+without spending an attempt, allowing another worker to resume it immediately.
+Handlers that remain live hold their leases until they settle or their process
+dies. Process death uses BullMQ stalled-worker recovery. Once all active callbacks
+settle, background shutdown closes the worker and queue connections. Direct
+backend `close()` remains a draining operation; the system owns the grace period.
+Redis requests and worker startup retain their five-second bounds.
 
 ## Scheduling
 
